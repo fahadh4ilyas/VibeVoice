@@ -16,6 +16,7 @@ from transformers import (
     TrainerCallback,
 )
 from transformers import TrainingArguments as HfTrainingArguments
+from transformers.trainer import _is_peft_model
 
 from peft import LoraConfig, get_peft_model, TaskType
 
@@ -603,7 +604,7 @@ def main() -> None:
                 logger.warning(f"LoRA debug (on_step_end) failed: {e}")
 
     class VibeVoiceTrainer(Trainer):
-        def training_forward(self, model: VibeVoiceForConditionalGeneration, inputs: Dict[str, Any]):
+        def _training_forward(self, model: VibeVoiceForConditionalGeneration, inputs: Dict[str, Any]):
             """Custom forward pass for training with new diffusion loss calculation."""
             # Extract inputs
             input_ids = inputs.get("input_ids")
@@ -788,28 +789,28 @@ def main() -> None:
                     inputs["speech_semantic_tensors"] = sem.to(dtype=target_dtype)
 
             # Use custom training forward pass with new diffusion loss
-            outputs = self.training_forward(model, inputs)
+            outputs = self._training_forward(model, inputs)
 
             # Invariants: token/latent selection equality across views (warn, don't assert)
-            try:
-                al_mask = inputs.get("acoustic_loss_mask")
-                sp_masks = inputs.get("speech_masks")
-                sp_loss_sel = inputs.get("speeches_loss_input")
-                num_tok_total = int(acoustic_input_mask.sum().item()) if acoustic_input_mask is not None else 0
-                num_tok_loss = int(al_mask.sum().item()) if al_mask is not None else 0
-                num_lat_total = int(sp_masks.sum().item()) if sp_masks is not None else 0
-                num_lat_loss = int(((sp_loss_sel & sp_masks).sum().item())) if (sp_loss_sel is not None and sp_masks is not None) else 0
-                self.log({
-                    "debug/num_tok_total": float(num_tok_total),
-                    "debug/num_tok_loss": float(num_tok_loss),
-                    "debug/num_lat_total": float(num_lat_total),
-                    "debug/num_lat_loss": float(num_lat_loss),
-                })
-                if sp_loss_sel is not None and sp_masks is not None and al_mask is not None:
-                    if num_tok_loss != num_lat_loss:
-                        logger.warning(f"Loss selection mismatch: acoustic_loss_mask={num_tok_loss} vs speeches_loss_input={num_lat_loss}")
-            except Exception:
-                pass
+            # try:
+            #     al_mask = inputs.get("acoustic_loss_mask")
+            #     sp_masks = inputs.get("speech_masks")
+            #     sp_loss_sel = inputs.get("speeches_loss_input")
+            #     num_tok_total = int(acoustic_input_mask.sum().item()) if acoustic_input_mask is not None else 0
+            #     num_tok_loss = int(al_mask.sum().item()) if al_mask is not None else 0
+            #     num_lat_total = int(sp_masks.sum().item()) if sp_masks is not None else 0
+            #     num_lat_loss = int(((sp_loss_sel & sp_masks).sum().item())) if (sp_loss_sel is not None and sp_masks is not None) else 0
+            #     self.log({
+            #         "debug/num_tok_total": float(num_tok_total),
+            #         "debug/num_tok_loss": float(num_tok_loss),
+            #         "debug/num_lat_total": float(num_lat_total),
+            #         "debug/num_lat_loss": float(num_lat_loss),
+            #     })
+            #     if sp_loss_sel is not None and sp_masks is not None and al_mask is not None:
+            #         if num_tok_loss != num_lat_loss:
+            #             logger.warning(f"Loss selection mismatch: acoustic_loss_mask={num_tok_loss} vs speeches_loss_input={num_lat_loss}")
+            # except Exception:
+            #     pass
 
             # CE Loss
             logits = outputs.logits
@@ -819,28 +820,28 @@ def main() -> None:
             ce_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), ce_labels.view(-1))
 
             # Optional CE diagnostics
-            try:
-                self._debug_ce(shift_logits, ce_labels, attention_mask, acoustic_input_mask)
-            except Exception as e:
-                logger.warning(f"Failed invoking CE debug: {e}")
+            # try:
+            #     self._debug_ce(shift_logits, ce_labels, attention_mask, acoustic_input_mask)
+            # except Exception as e:
+            #     logger.warning(f"Failed invoking CE debug: {e}")
 
             # Diffusion loss
             diffusion_loss = outputs.diffusion_loss if outputs.diffusion_loss is not None else torch.tensor(0.0, device=ce_loss.device)
             total = training_args.ce_loss_weight * ce_loss + training_args.diffusion_loss_weight * diffusion_loss
 
             # Logs
-            try:
-                prefix = "train" if model.training else "eval"
-                self.log({
-                    f"{prefix}/ce_loss": ce_loss.detach().item(),
-                    f"{prefix}/diffusion_loss": diffusion_loss.detach().item() if isinstance(diffusion_loss, torch.Tensor) else float(diffusion_loss),
-                })
-                if hasattr(self, "optimizer") and self.optimizer is not None and len(self.optimizer.param_groups) > 0:
-                    lr_val = self.optimizer.param_groups[0].get("lr", None)
-                    if lr_val is not None:
-                        self.log({"train/learning_rate_real": float(lr_val)})
-            except Exception:
-                pass
+            # try:
+            #     prefix = "train" if model.training else "eval"
+            #     self.log({
+            #         f"{prefix}/ce_loss": ce_loss.detach().item(),
+            #         f"{prefix}/diffusion_loss": diffusion_loss.detach().item() if isinstance(diffusion_loss, torch.Tensor) else float(diffusion_loss),
+            #     })
+            #     if hasattr(self, "optimizer") and self.optimizer is not None and len(self.optimizer.param_groups) > 0:
+            #         lr_val = self.optimizer.param_groups[0].get("lr", None)
+            #         if lr_val is not None:
+            #             self.log({"train/learning_rate_real": float(lr_val)})
+            # except Exception:
+            #     pass
 
             return (total, outputs) if return_outputs else total
 
@@ -924,6 +925,151 @@ def main() -> None:
             except Exception as e:
                 logger.warning(f"Failed to save LoRA assets: {e}")
 
+        # ------------- CRITICAL LOAD CHECKPOINT OVERRIDES -------------
+
+        def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+            if model is None:
+                model = self.model
+            
+            lora_out = os.path.join(resume_from_checkpoint, "lora")
+
+            adapter_subdirs = (
+                [
+                    folder_name
+                    for folder_name in os.listdir(lora_out)
+                    if os.path.isdir(os.path.join(lora_out, folder_name))
+                    and (
+                        os.path.isfile(os.path.join(lora_out, folder_name, 'adapter_model.bin'))
+                        or os.path.isfile(os.path.join(lora_out, folder_name, 'adapter_model.safetensors'))
+                    )
+                ]
+                if os.path.isdir(lora_out)
+                else []
+            )
+
+            try:
+                # --- LLM PEFT adapters (if LoRA-wrapped) ---
+                language_model = getattr(model.model, "language_model", None)
+                logger.info('Loading LoRA adapters from %s', lora_out)
+                # If train a model using PEFT & LoRA, assume that adapter have been saved properly.
+                # TODO: in the future support only specific min PEFT versions
+                if _is_peft_model(language_model):
+                    if os.path.exists(lora_out):
+                        # For BC for older PEFT versions
+                        if hasattr(language_model, "active_adapters"):
+                            active_adapters = language_model.active_adapters
+                            if len(active_adapters) > 1:
+                                logger.warning("Multiple active adapters detected will only consider the first adapter")
+                            active_adapter = active_adapters[0]
+                        else:
+                            active_adapter = language_model.active_adapter
+
+                        if adapter_subdirs:
+                            for subdir_name in adapter_subdirs:
+                                peft_id = os.path.join(lora_out, subdir_name)
+                                language_model.load_adapter(peft_id, subdir_name, is_trainable=(subdir_name == active_adapter))
+                            language_model.set_adapter(active_adapter)
+                        else:
+                            language_model.load_adapter(lora_out, active_adapter, is_trainable=True)
+                    else:
+                        logger.warning(
+                            "The intermediate checkpoints of PEFT for language model may not be saved correctly, "
+                            "consider using a custom callback to save adapter_model.bin in corresponding saving folders. "
+                            "Check some examples here: https://github.com/huggingface/peft/issues/96"
+                        )
+                else:
+                    logger.warning("Could not load adapter language model, make sure to have `peft>=0.3.0` installed")
+
+                # --- load diffusion head ---
+                pred_head = getattr(model.model, "prediction_head", None)
+                diffusion_path = os.path.join(lora_out, "diffusion_head")
+                logger.info('Loading diffusion head from %s', diffusion_path)
+                adapter_subdirs = (
+                    [
+                        folder_name
+                        for folder_name in os.listdir(diffusion_path)
+                        if os.path.isdir(os.path.join(diffusion_path, folder_name))
+                        and (
+                            os.path.isfile(os.path.join(diffusion_path, folder_name, 'adapter_model.bin'))
+                            or os.path.isfile(os.path.join(diffusion_path, folder_name, 'adapter_model.safetensors'))
+                        )
+                    ]
+                    if os.path.isdir(diffusion_path)
+                    else []
+                )
+                # If train a model using PEFT & LoRA, assume that adapter have been saved properly.
+                # TODO: in the future support only specific min PEFT versions
+                if _is_peft_model(pred_head):
+                    if os.path.exists(diffusion_path):
+                        # For BC for older PEFT versions
+                        if hasattr(pred_head, "active_adapters"):
+                            active_adapters = pred_head.active_adapters
+                            if len(active_adapters) > 1:
+                                logger.warning("Multiple active adapters detected will only consider the first adapter")
+                            active_adapter = active_adapters[0]
+                        else:
+                            active_adapter = pred_head.active_adapter
+
+                        if adapter_subdirs:
+                            for subdir_name in adapter_subdirs:
+                                peft_id = os.path.join(diffusion_path, subdir_name)
+                                pred_head.load_adapter(peft_id, subdir_name, is_trainable=(subdir_name == active_adapter))
+                            pred_head.set_adapter(active_adapter)
+                        else:
+                            pred_head.load_adapter(diffusion_path, active_adapter, is_trainable=True)
+                    else:
+                        logger.warning(
+                            "The intermediate checkpoints of PEFT for diffusion head may not be saved correctly, "
+                            "consider using a custom callback to save adapter_model.bin in corresponding saving folders. "
+                            "Check some examples here: https://github.com/huggingface/peft/issues/96"
+                        )
+                elif pred_head is not None and hasattr(pred_head, "state_dict"):
+                    possible_files = [
+                        os.path.join(diffusion_path, "model.safetensors"),
+                        os.path.join(diffusion_path, "diffusion_head_full.bin"),
+                        os.path.join(lora_out, "diffusion_head_full.bin"),
+                    ]
+
+                    trained_weights_path = None
+                    for path in possible_files:
+                        if os.path.exists(path):
+                            trained_weights_path = path
+                            break
+                    
+                    if trained_weights_path is None:
+                        logger.warning(
+                            f"Diffusion head weights not found. Searched:\n" +
+                            "\n".join(f"  - {p}" for p in possible_files)
+                        )
+                    else:
+                        if trained_weights_path.endswith(".safetensors"):
+                            from safetensors.torch import load_file
+                            trained_state_dict = load_file(trained_weights_path)
+                        else:
+                            trained_state_dict = torch.load(trained_weights_path, map_location="cpu")
+                        pred_head.load_state_dict(trained_state_dict, strict=True)
+                
+                # --- Connectors (plain state_dicts) ---
+                ac = getattr(model.model, "acoustic_connector", None)
+                ac_path = os.path.join(lora_out, "acoustic_connector")
+                logger.info('Loading acoustic connector from %s', ac_path)
+                if os.path.exists(ac_path) and ac is not None and hasattr(ac, "state_dict"):
+                    ac_state_path = os.path.join(ac_path, "pytorch_model.bin")
+                    if os.path.isfile(ac_state_path):
+                        ac_sd = torch.load(ac_state_path, map_location="cpu")
+                        ac.load_state_dict(ac_sd, strict=True)
+
+                se = getattr(model.model, "semantic_connector", None)
+                se_path = os.path.join(lora_out, "semantic_connector")
+                logger.info('Loading semantic connector from %s', se_path)
+                if os.path.exists(se_path) and se is not None and hasattr(se, "state_dict"):
+                    se_state_path = os.path.join(se_path, "pytorch_model.bin")
+                    if os.path.isfile(se_state_path):
+                        se_sd = torch.load(se_state_path, map_location="cpu")
+                        se.load_state_dict(se_sd, strict=True)
+            except Exception as e:
+                logger.warning(f"Could not load LLM checkpoint: {e}")
+
 
     # ------------- Build the Trainer -------------
 
@@ -937,57 +1083,57 @@ def main() -> None:
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        callbacks=[ema_cb, LoRADebugCallback(log_every_n_steps=(int(getattr(training_args, "logging_steps", 50) or 50)))],
+        callbacks=[ema_cb], # LoRADebugCallback(log_every_n_steps=(int(getattr(training_args, "logging_steps", 50) or 50)))],
     )
 
     # Optional debug pre-training save
-    if getattr(training_args, "debug_save", False):
-        try:
-            debug_dir = os.path.join(training_args.output_dir, "debug_initial")
-            lora_out = os.path.join(debug_dir, "lora")
-            os.makedirs(lora_out, exist_ok=True)
-            logger.info(f"[debug_save] Saving initial (pre-training) model components to: {debug_dir}")
-            # language model adapters / base
-            try:
-                if hasattr(model.model.language_model, "save_pretrained"):
-                    model.model.language_model.save_pretrained(lora_out)
-            except Exception as e_lm:
-                logger.warning(f"[debug_save] Failed to save language_model: {e_lm}")
-            # diffusion head
-            try:
-                if hasattr(model.model, "prediction_head") and hasattr(model.model.prediction_head, "save_pretrained"):
-                    model.model.prediction_head.save_pretrained(os.path.join(lora_out, "diffusion_head"))
-            except Exception as e_head:
-                logger.warning(f"[debug_save] Failed to save prediction_head: {e_head}")
-            # NEW: full diffusion head state_dict as fallback
-            try:
-                ph = getattr(model.model, "prediction_head", None)
-                if ph is not None and hasattr(ph, "state_dict"):
-                    sd = ph.state_dict()
-                    torch.save(sd, os.path.join(lora_out, "diffusion_head_full.bin"))
-                    os.makedirs(os.path.join(lora_out, "diffusion_head"), exist_ok=True)
-                    torch.save(sd, os.path.join(lora_out, "diffusion_head", "diffusion_head_full.bin"))
-            except Exception as e:
-                logger.warning(f"[debug_save] Failed to save FULL diffusion head: {e}")
-            # connectors
-            try:
-                ac_conn = getattr(model.model, "acoustic_connector", None)
-                if ac_conn is not None:
-                    ac_dir = os.path.join(lora_out, "acoustic_connector")
-                    os.makedirs(ac_dir, exist_ok=True)
-                    torch.save(ac_conn.state_dict(), os.path.join(ac_dir, "pytorch_model.bin"))
-            except Exception as e_ac:
-                logger.warning(f"[debug_save] Failed to save acoustic_connector: {e_ac}")
-            try:
-                se_conn = getattr(model.model, "semantic_connector", None)
-                if se_conn is not None:
-                    se_dir = os.path.join(lora_out, "semantic_connector")
-                    os.makedirs(se_dir, exist_ok=True)
-                    torch.save(se_conn.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))
-            except Exception as e_se:
-                logger.warning(f"[debug_save] Failed to save semantic_connector: {e_se}")
-        except Exception as e:
-            logger.warning(f"[debug_save] Unexpected failure saving initial components: {e}")
+    # if getattr(training_args, "debug_save", False):
+    #     try:
+    #         debug_dir = os.path.join(training_args.output_dir, "debug_initial")
+    #         lora_out = os.path.join(debug_dir, "lora")
+    #         os.makedirs(lora_out, exist_ok=True)
+    #         logger.info(f"[debug_save] Saving initial (pre-training) model components to: {debug_dir}")
+    #         # language model adapters / base
+    #         try:
+    #             if hasattr(model.model.language_model, "save_pretrained"):
+    #                 model.model.language_model.save_pretrained(lora_out)
+    #         except Exception as e_lm:
+    #             logger.warning(f"[debug_save] Failed to save language_model: {e_lm}")
+    #         # diffusion head
+    #         try:
+    #             if hasattr(model.model, "prediction_head") and hasattr(model.model.prediction_head, "save_pretrained"):
+    #                 model.model.prediction_head.save_pretrained(os.path.join(lora_out, "diffusion_head"))
+    #         except Exception as e_head:
+    #             logger.warning(f"[debug_save] Failed to save prediction_head: {e_head}")
+    #         # NEW: full diffusion head state_dict as fallback
+    #         try:
+    #             ph = getattr(model.model, "prediction_head", None)
+    #             if ph is not None and hasattr(ph, "state_dict"):
+    #                 sd = ph.state_dict()
+    #                 torch.save(sd, os.path.join(lora_out, "diffusion_head_full.bin"))
+    #                 os.makedirs(os.path.join(lora_out, "diffusion_head"), exist_ok=True)
+    #                 torch.save(sd, os.path.join(lora_out, "diffusion_head", "diffusion_head_full.bin"))
+    #         except Exception as e:
+    #             logger.warning(f"[debug_save] Failed to save FULL diffusion head: {e}")
+    #         # connectors
+    #         try:
+    #             ac_conn = getattr(model.model, "acoustic_connector", None)
+    #             if ac_conn is not None:
+    #                 ac_dir = os.path.join(lora_out, "acoustic_connector")
+    #                 os.makedirs(ac_dir, exist_ok=True)
+    #                 torch.save(ac_conn.state_dict(), os.path.join(ac_dir, "pytorch_model.bin"))
+    #         except Exception as e_ac:
+    #             logger.warning(f"[debug_save] Failed to save acoustic_connector: {e_ac}")
+    #         try:
+    #             se_conn = getattr(model.model, "semantic_connector", None)
+    #             if se_conn is not None:
+    #                 se_dir = os.path.join(lora_out, "semantic_connector")
+    #                 os.makedirs(se_dir, exist_ok=True)
+    #                 torch.save(se_conn.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))
+    #         except Exception as e_se:
+    #             logger.warning(f"[debug_save] Failed to save semantic_connector: {e_se}")
+    #     except Exception as e:
+    #         logger.warning(f"[debug_save] Unexpected failure saving initial components: {e}")
 
     if getattr(training_args, "gradient_checkpointing", False):
         try:
@@ -996,7 +1142,7 @@ def main() -> None:
             logger.warning("Failed to enable gradient checkpointing on the model.")
 
     if training_args.do_train:
-        trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+        trainer.train(resume_from_checkpoint=bool(training_args.resume_from_checkpoint))
     
         lora_out = os.path.join(training_args.output_dir, "lora")
         os.makedirs(lora_out, exist_ok=True)
