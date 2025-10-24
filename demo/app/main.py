@@ -248,11 +248,11 @@ async def tts_streamer(
                     audio_streamer=audio_streamer,
                     stop_check_fn=stop_check_fn,
                     tokenizer=processor.tokenizer,
-                    generation_config={'do_sample': False},
                     max_new_tokens=None,
                     cfg_scale=config.cfg_scale,
                     is_prefill=True,
-                    verbose=True
+                    verbose=True,
+                    seed=config.seed,
                 )
                 # clear torch cache after generation
                 torch.cuda.empty_cache()

@@ -12,6 +12,7 @@ class ApiConfig(BaseSettings):
     forwarded_allow_ips: str = Field('127.0.0.1')
     model_path: str = Field(...)
     cfg_scale: float = Field(2.0)
+    seed: int = Field(42)
 
     class Config:
         env_file = dotenv.find_dotenv(usecwd=True)
