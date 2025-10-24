@@ -1,0 +1,8 @@
+fastapi
+python-multipart
+pydantic<3.0
+pydantic-settings
+orjson
+gunicorn
+uvicorn
+python-dotenv
