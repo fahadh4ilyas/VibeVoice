@@ -4,14 +4,13 @@ import io
 import wave
 import asyncio
 import threading
-import struct
 import traceback
 import timeit
 from typing import Optional, Any, Literal
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, Request, HTTPException, Body, Query
+from fastapi import FastAPI, Request, Body, Query, BackgroundTasks
 from fastapi.responses import StreamingResponse, ORJSONResponse, Response, RedirectResponse
 
 import torch
@@ -33,6 +32,7 @@ executor = ThreadPoolExecutor(max_workers=4)
 # --- model placeholders (load your model in startup) ---
 processor: Optional[VibeVoiceProcessor] = None
 model: Optional[VibeVoiceForConditionalGenerationInference] = None
+lock = threading.Lock()
 voice_list = {p.stem.split('_')[0]: p for p in Path(os.path.join(ROOT_DIR, 'sample-voices')).glob('*.wav')}
 
 @asynccontextmanager
@@ -55,10 +55,6 @@ app = FastAPI(title='Super LLM API',
     description='API for generating text using LLM with OpenAI Format',
     version='1.0.0',
     lifespan=lifespan)
-
-
-# single-call lock: only one user at a time
-app.state.instance_call_lock = asyncio.Lock()
 
 
 @app.exception_handler(Exception)
@@ -178,7 +174,8 @@ async def gen_wav(
     request: Request,
     text: str = Query(...),
     speaker: Literal["alloy", "ash", "echo", "nova"] = Query("alloy"),
-    lang: Literal["en", "id"] = Query('id')
+    lang: Literal["en", "id"] = Query('id'),
+    timeout: float = Query(-1)
 ):
     """
     Streams a TTS response produced by the model.
@@ -187,14 +184,15 @@ async def gen_wav(
     - streaming binary WAV via chunked transfer.
     """
 
-    return await tts_streamer(request, text, speaker, lang)
+    return await tts_streamer(request, text, speaker, lang, timeout)
 
 @app.post("/tts")
 async def generate_wav(
     request: Request,
     text: str = Body(...),
     speaker: Literal["alloy", "ash", "echo", "nova"] = Body("alloy"),
-    lang: Literal["en", "id"] = Body('id')
+    lang: Literal["en", "id"] = Body('id'),
+    timeout: float = Body(-1)
 ):
     """
     Streams a TTS response produced by the model.
@@ -203,132 +201,139 @@ async def generate_wav(
     - streaming binary WAV via chunked transfer.
     """
 
-    return await tts_streamer(request, text, speaker, lang)
+    return await tts_streamer(request, text, speaker, lang, timeout)
 
 async def tts_streamer(
     request: Request,
     text: str,
     speaker: Literal["alloy", "ash", "echo", "nova"],
-    lang: Literal["en", "id"]
+    lang: Literal["en", "id"],
+    timeout: float
 ):
-    global model, processor, executor
+    global model, processor, executor, lock
 
     # Acquire single-call lock so other requests wait
-    async with app.state.instance_call_lock:
-        batch_size = 1  # streaming a single sample per request; adapt for batching
-        sample_rate = 24000
-        num_channels = 1
+    if not lock.acquire(timeout=timeout if timeout >= 0 else -1):
+        return ORJSONResponse(
+            {"status": "error", "error": "Another request is in progress. Please try again later."},
+            status_code=429
+        )
+    batch_size = 1  # streaming a single sample per request; adapt for batching
+    sample_rate = 24000
+    num_channels = 1
 
-        # instantiate streamer (adjust signature if needed)
-        audio_streamer = AsyncAudioStreamer(batch_size=batch_size, timeout=1.0)  # type: ignore
+    # instantiate streamer (adjust signature if needed)
+    audio_streamer = AsyncAudioStreamer(batch_size=batch_size, timeout=1.0)  # type: ignore
 
-        # cooperative stop flag
-        stop_event = threading.Event()
+    # cooperative stop flag
+    stop_event = threading.Event()
 
-        def stop_check_fn() -> bool:
-            return stop_event.is_set()
+    def stop_check_fn() -> bool:
+        return stop_event.is_set()
 
-        # blocking wrapper to call the synchronous model.generate(...) that writes into audio_streamer
-        def blocking_generate(prompt_text: str):
-            try:
-                full_script = "Speaker 1: " + prompt_text
-                voice_sample = voice_list[f"{lang}-{speaker}"].as_posix()
-                inputs = processor(
-                    text=[full_script], # Wrap in list for batch processing
-                    voice_samples=[voice_sample], # Wrap in list for batch processing
-                    padding=True,
-                    return_tensors="pt",
-                    return_attention_mask=True,
-                )
-                # for k, v in inputs.items():
-                #     if torch.is_tensor(v):
-                #         inputs[k] = v.to(model.device)
-                model.generate(
-                    **inputs,
-                    audio_streamer=audio_streamer,
-                    stop_check_fn=stop_check_fn,
-                    tokenizer=processor.tokenizer,
-                    max_new_tokens=None,
-                    cfg_scale=config.cfg_scale,
-                    is_prefill=True,
-                    verbose=True,
-                    seed=config.seed,
-                )
-                # clear torch cache after generation
-                torch.cuda.empty_cache()
-                return {"status": "ok", "info": "generate finished normally"}
-            except Exception as exc:
-                audio_streamer.end()
-                LOGGER.error(traceback.format_exc())
-                return {"status": "error", "error": str(exc)}
+    # blocking wrapper to call the synchronous model.generate(...) that writes into audio_streamer
+    def blocking_generate(prompt_text: str):
+        try:
+            full_script = "Speaker 1: " + prompt_text
+            voice_sample = voice_list[f"{lang}-{speaker}"].as_posix()
+            inputs = processor(
+                text=[full_script], # Wrap in list for batch processing
+                voice_samples=[voice_sample], # Wrap in list for batch processing
+                padding=True,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            # for k, v in inputs.items():
+            #     if torch.is_tensor(v):
+            #         inputs[k] = v.to(model.device)
+            model.generate(
+                **inputs,
+                audio_streamer=audio_streamer,
+                stop_check_fn=stop_check_fn,
+                tokenizer=processor.tokenizer,
+                max_new_tokens=None,
+                cfg_scale=config.cfg_scale,
+                is_prefill=True,
+                verbose=True,
+                seed=config.seed,
+            )
+            # clear torch cache after generation
+            torch.cuda.empty_cache()
+            return {"status": "ok", "info": "generate finished normally"}
+        except Exception as exc:
+            LOGGER.error(traceback.format_exc())
+            return {"status": "error", "error": str(exc)}
+        finally:
+            audio_streamer.end()
+            lock.release()
 
-        loop = asyncio.get_running_loop()
-        gen_future = loop.run_in_executor(executor, blocking_generate, text)
+    loop = asyncio.get_running_loop()
+    gen_future = loop.run_in_executor(executor, blocking_generate, text)
 
 
-        async def disconnect_watcher():
-            try:
-                is_disc = await request.state.is_disconnected()
-            except Exception:
-                # treat errors as disconnected
-                is_disc = True
-            if is_disc:
-                stop_event.set()
+    async def disconnect_watcher():
+        try:
+            is_disc = await request.state.is_disconnected()
+        except Exception:
+            # treat errors as disconnected
+            is_disc = True
+        if is_disc:
+            stop_event.set()
 
-        disconnect_task = asyncio.create_task(disconnect_watcher())
+    disconnect_task = asyncio.create_task(disconnect_watcher())
 
-        async def stream_generator():
-            """
-            Yields:
-              - initial WAV header bytes (with placeholder sizes)
-              - then PCM16 chunk bytes as received from audio_streamer
-              - finally the generate() result metadata as a small JSON/text chunk (optional)
-            """
-            try:
-                # send WAV header first
-                header = make_wav_header(sample_rate, num_channels)
-                yield header
+    async def stream_generator():
+        """
+        Yields:
+            - initial WAV header bytes (with placeholder sizes)
+            - then PCM16 chunk bytes as received from audio_streamer
+            - finally the generate() result metadata as a small JSON/text chunk (optional)
+        """
+        try:
+            # send WAV header first
+            header = make_wav_header(sample_rate, num_channels)
+            yield header
 
-                # iterate over audio_streamer async iterator (your AsyncAudioStreamer.__aiter__)
-                async for batch_chunks in audio_streamer:
-                    # batch_chunks: dict mapping sample_idx -> chunk
-                    # We assume batch_size==1 for simplicity; stream only index 0 if present
-                    # But handle multiple channels if your chunk data contains them.
-                    if 0 in batch_chunks:
-                        chunk = batch_chunks[0]
+            # iterate over audio_streamer async iterator (your AsyncAudioStreamer.__aiter__)
+            async for batch_chunks in audio_streamer:
+                # batch_chunks: dict mapping sample_idx -> chunk
+                # We assume batch_size==1 for simplicity; stream only index 0 if present
+                # But handle multiple channels if your chunk data contains them.
+                if 0 in batch_chunks:
+                    chunk = batch_chunks[0]
+                    pcm_bytes = chunk_to_pcm16_bytes(chunk, num_channels)
+                    if pcm_bytes:
+                        yield pcm_bytes
+                else:
+                    # if other indices present, process in increasing order and interleave their PCM
+                    for idx in sorted(batch_chunks.keys()):
+                        chunk = batch_chunks[idx]
                         pcm_bytes = chunk_to_pcm16_bytes(chunk, num_channels)
                         if pcm_bytes:
                             yield pcm_bytes
-                    else:
-                        # if other indices present, process in increasing order and interleave their PCM
-                        for idx in sorted(batch_chunks.keys()):
-                            chunk = batch_chunks[idx]
-                            pcm_bytes = chunk_to_pcm16_bytes(chunk, num_channels)
-                            if pcm_bytes:
-                                yield pcm_bytes
 
-                    # let event loop schedule (helps responsiveness)
-                    # await asyncio.sleep(0)
+                # let event loop schedule (helps responsiveness)
+                # await asyncio.sleep(0)
 
-                # generation finished normally; await final result from blocking generate
-                gen_result = await gen_future
-                # optionally yield small trailing info as text chunk (not part of wav)
-                # Many clients will ignore data after WAV; if you want strictly valid WAV only, omit this.
-                # We omit extra trailing bytes to keep stream pure WAV.
-                return  # end generator; connection closes naturally
-            except asyncio.CancelledError:
-                # generator cancelled (client disconnected); ensure stop flag
-                stop_event.set()
-                raise
-            except Exception as exc:
-                # On error, set stop flag and re-raise so client sees connection drop
-                stop_event.set()
-                raise
-            finally:
-                stop_event.set()
+            # generation finished normally; await final result from blocking generate
+            gen_result = await gen_future
+            # optionally yield small trailing info as text chunk (not part of wav)
+            # Many clients will ignore data after WAV; if you want strictly valid WAV only, omit this.
+            # We omit extra trailing bytes to keep stream pure WAV.
+            return  # end generator; connection closes naturally
+        except asyncio.CancelledError:
+            # generator cancelled (client disconnected); ensure stop flag
+            stop_event.set()
+            raise
+        except Exception as exc:
+            # On error, set stop flag and re-raise so client sees connection drop
+            stop_event.set()
+            raise
+        finally:
+            stop_event.set()
 
-        # Build binary streaming response with WAV mime type
-        return StreamingResponse(stream_generator(), media_type="audio/wav")
+    # Build binary streaming response with WAV mime type
+    return StreamingResponse(stream_generator(), media_type="audio/wav")
 
 @app.get('/', include_in_schema=False)
 async def redirect():
