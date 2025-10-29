@@ -180,7 +180,7 @@ async def gen_wav(
     """
     Streams a TTS response produced by the model.
     - only one caller at a time (asyncio.Lock).
-    - cooperative stop via stop_event + model's stop_check_fn.
+    - cooperative stop via audio_streamer.end().
     - streaming binary WAV via chunked transfer.
     """
 
@@ -197,7 +197,7 @@ async def generate_wav(
     """
     Streams a TTS response produced by the model.
     - only one caller at a time (asyncio.Lock).
-    - cooperative stop via stop_event + model's stop_check_fn.
+    - cooperative stop via audio_streamer.end().
     - streaming binary WAV via chunked transfer.
     """
 
@@ -225,11 +225,6 @@ async def tts_streamer(
     # instantiate streamer (adjust signature if needed)
     audio_streamer = AsyncAudioStreamer(batch_size=batch_size, timeout=1.0)  # type: ignore
 
-    # cooperative stop flag
-    stop_event = threading.Event()
-
-    def stop_check_fn() -> bool:
-        return stop_event.is_set()
 
     # blocking wrapper to call the synchronous model.generate(...) that writes into audio_streamer
     def blocking_generate(prompt_text: str):
@@ -249,7 +244,6 @@ async def tts_streamer(
             model.generate(
                 **inputs,
                 audio_streamer=audio_streamer,
-                stop_check_fn=stop_check_fn,
                 tokenizer=processor.tokenizer,
                 max_new_tokens=None,
                 cfg_scale=config.cfg_scale,
@@ -278,7 +272,7 @@ async def tts_streamer(
             # treat errors as disconnected
             is_disc = True
         if is_disc:
-            stop_event.set()
+            audio_streamer.end()
 
     disconnect_task = asyncio.create_task(disconnect_watcher())
 
@@ -323,14 +317,14 @@ async def tts_streamer(
             return  # end generator; connection closes naturally
         except asyncio.CancelledError:
             # generator cancelled (client disconnected); ensure stop flag
-            stop_event.set()
+            audio_streamer.end()
             raise
         except Exception as exc:
             # On error, set stop flag and re-raise so client sees connection drop
-            stop_event.set()
+            audio_streamer.end()
             raise
         finally:
-            stop_event.set()
+            audio_streamer.end()
 
     # Build binary streaming response with WAV mime type
     return StreamingResponse(stream_generator(), media_type="audio/wav")
