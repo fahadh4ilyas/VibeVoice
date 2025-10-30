@@ -7,12 +7,12 @@ import asyncio
 import threading
 import traceback
 import timeit
+import base64
 from typing import Optional, Any, Literal, List
-from dataclasses import asdict
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, Request, Body, Query, BackgroundTasks
+from fastapi import FastAPI, Request, Body, Query, Form, File, UploadFile
 from fastapi.responses import StreamingResponse, ORJSONResponse, Response, RedirectResponse
 
 import torch
@@ -20,6 +20,7 @@ import numpy as np
 from contextlib import asynccontextmanager
 
 from .config import config, LOGGER_ACCESS, LOGGER
+from .tools import base64_audio_to_numpy
 
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference, VibeVoiceStepOutput
 from vibevoice.modular.lora_loading import load_lora_assets
@@ -41,6 +42,7 @@ class DataQueue:
     def put(
         self,
         text: str,
+        audio_base64: Optional[str],
         lang: str,
         speaker: str,
         do_sample: bool,
@@ -48,7 +50,15 @@ class DataQueue:
         top_p: float,
         audio_streamer: AsyncAudioStreamer):
         full_script = "Speaker 1: " + text
-        voice_sample = voice_list[f"{lang}-{speaker}"].as_posix()
+        if audio_base64 is not None:
+            voice_sample = base64_audio_to_numpy(
+                audio_base64,
+                mono=True,
+                target_sr=24000,
+                dtype="float32",
+            )[0]
+        else:
+            voice_sample = voice_list[f"{lang}-{speaker}"].as_posix()
         inputs = self.processor(
             text=[full_script], # Wrap in list for batch processing
             voice_samples=[voice_sample], # Wrap in list for batch processing
@@ -63,7 +73,7 @@ class DataQueue:
             max_new_tokens=None,
             cfg_scale=config.cfg_scale,
             is_prefill=True,
-            verbose=False,
+            verbose=True,
             seed=config.seed,
             do_sample=do_sample,
             temperature=temperature,
@@ -214,7 +224,7 @@ async def logging_request(request: Request, call_next):
     if params:
         LOGGER_ACCESS.info(f'{client_data} - "{request.method.upper()} {request.url.path} {request.url.scheme.upper()}/1.1" PARAMS: {params}')
     if body:
-        LOGGER_ACCESS.info(f'{client_data} - "{request.method.upper()} {request.url.path} {request.url.scheme.upper()}/1.1" BODY: {await request.body()}')
+        LOGGER_ACCESS.info(f'{client_data} - "{request.method.upper()} {request.url.path} {request.url.scheme.upper()}/1.1" BODY: {(await request.body())[:256]}')
 
     start = timeit.default_timer()
     request.state.is_disconnected = request.is_disconnected
@@ -322,7 +332,7 @@ async def gen_wav(
     - streaming binary WAV via chunked transfer.
     """
 
-    return await tts_streamer(request, text, speaker, lang, do_sample, temperature, top_p)
+    return await tts_streamer(request, text, None, speaker, lang, do_sample, temperature, top_p)
 
 @app.post("/tts")
 async def generate_wav(
@@ -341,11 +351,28 @@ async def generate_wav(
     - streaming binary WAV via chunked transfer.
     """
 
-    return await tts_streamer(request, text, speaker, lang, do_sample, temperature, top_p)
+    return await tts_streamer(request, text, None, speaker, lang, do_sample, temperature, top_p)
+
+@app.post("/voice_clone")
+async def voice_clone_form(
+    request: Request,
+    text: str = Form(...),
+    audio_file: UploadFile = File(...),
+    do_sample: bool = Form(False),
+    temperature: float = Form(1.0),
+    top_p: float = Form(1.0)
+):
+    """
+    Clones a voice from the provided audio file in form upload.
+    """
+    audio_bytes = await audio_file.read()
+    audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
+    return await tts_streamer(request, text, audio_base64, "alloy", "id", do_sample, temperature, top_p)
 
 async def tts_streamer(
     request: Request,
     text: str,
+    audio_base64: Optional[str],
     speaker: Literal["alloy", "ash", "echo", "nova"],
     lang: Literal["en", "id"],
     do_sample: bool,
@@ -361,7 +388,7 @@ async def tts_streamer(
     # instantiate streamer (adjust signature if needed)
     audio_streamer = AsyncAudioStreamer(batch_size=batch_size, timeout=1.0)  # type: ignore
 
-    data_queue.put(text, lang, speaker, do_sample, temperature, top_p, audio_streamer)
+    data_queue.put(text, audio_base64, lang, speaker, do_sample, temperature, top_p, audio_streamer)
 
     async def disconnect_watcher():
         try:
