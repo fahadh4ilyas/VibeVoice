@@ -234,6 +234,22 @@ async def logging_request(request: Request, call_next):
     return response
 
 
+# --- helper to build a complete WAV file from PCM16 bytes ---
+def build_wav_from_pcm(pcm_bytes: bytes, sample_rate: int, num_channels: int, sampwidth: int = 2) -> bytes:
+    """
+    Create a valid WAV file (RIFF) containing pcm_bytes (little-endian PCM16).
+    sampwidth is bytes per sample (2 for PCM16).
+    """
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wf:
+        wf.setnchannels(num_channels)
+        wf.setsampwidth(sampwidth)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    out.seek(0)
+    return out.read()
+
+
 def make_wav_header(
     sample_rate: int,
     num_channels: int,
@@ -323,7 +339,8 @@ async def gen_wav(
     lang: Literal["en", "id"] = Query('id'),
     do_sample: bool = Query(False),
     temperature: float = Query(1.0, ge=0.0, le=2.0),
-    top_p: float = Query(1.0, le=1.0, ge=0.0)
+    top_p: float = Query(1.0, le=1.0, ge=0.0),
+    do_stream: bool = Query(False)
 ):
     """
     Streams a TTS response produced by the model.
@@ -332,7 +349,7 @@ async def gen_wav(
     - streaming binary WAV via chunked transfer.
     """
 
-    return await tts_streamer(request, text, None, speaker, lang, do_sample, temperature, top_p)
+    return await tts_streamer(request, text, None, speaker, lang, do_sample, temperature, top_p, do_stream)
 
 @app.post("/tts")
 async def generate_wav(
@@ -342,7 +359,8 @@ async def generate_wav(
     lang: Literal["en", "id"] = Body('id'),
     do_sample: bool = Body(False),
     temperature: float = Body(1.0, ge=0.0, le=2.0),
-    top_p: float = Body(1.0, le=1.0, ge=0.0)
+    top_p: float = Body(1.0, le=1.0, ge=0.0),
+    do_stream: bool = Body(False)
 ):
     """
     Streams a TTS response produced by the model.
@@ -351,7 +369,7 @@ async def generate_wav(
     - streaming binary WAV via chunked transfer.
     """
 
-    return await tts_streamer(request, text, None, speaker, lang, do_sample, temperature, top_p)
+    return await tts_streamer(request, text, None, speaker, lang, do_sample, temperature, top_p, do_stream)
 
 @app.post("/voice_clone")
 async def voice_clone_form(
@@ -360,14 +378,15 @@ async def voice_clone_form(
     audio_file: UploadFile = File(...),
     do_sample: bool = Form(False),
     temperature: float = Form(1.0),
-    top_p: float = Form(1.0)
+    top_p: float = Form(1.0),
+    do_stream: bool = Form(False)
 ):
     """
     Clones a voice from the provided audio file in form upload.
     """
     audio_bytes = await audio_file.read()
     audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
-    return await tts_streamer(request, text, audio_base64, "alloy", "id", do_sample, temperature, top_p)
+    return await tts_streamer(request, text, audio_base64, "alloy", "id", do_sample, temperature, top_p, do_stream)
 
 async def tts_streamer(
     request: Request,
@@ -377,7 +396,8 @@ async def tts_streamer(
     lang: Literal["en", "id"],
     do_sample: bool,
     temperature: float,
-    top_p: float
+    top_p: float,
+    do_stream: bool
 ):
     global data_queue
 
@@ -400,6 +420,40 @@ async def tts_streamer(
             audio_streamer.end()
 
     disconnect_task = asyncio.create_task(disconnect_watcher())
+
+    if not do_stream:
+        pcm_chunks = []
+        try:
+            async for batch_chunks in audio_streamer:
+                if 0 in batch_chunks:
+                    chunk = batch_chunks[0]
+                    pcm_bytes = chunk_to_pcm16_bytes(chunk, num_channels)
+                    if pcm_bytes:
+                        pcm_chunks.append(pcm_bytes)
+                else:
+                    for idx in sorted(batch_chunks.keys()):
+                        chunk = batch_chunks[idx]
+                        pcm_bytes = chunk_to_pcm16_bytes(chunk, num_channels)
+                        if pcm_bytes:
+                            pcm_chunks.append(pcm_bytes)
+            # finished streaming; assemble all pcm bytes
+            all_pcm = b"".join(pcm_chunks)
+            full_wav = build_wav_from_pcm(all_pcm, sample_rate, num_channels, sampwidth=2)
+            headers = {
+                "Content-Type": "audio/wav",
+                "Content-Length": str(len(full_wav)),
+                # optional: suggest filename for downloads
+                "Content-Disposition": f'attachment; filename="result.wav"'
+            }
+            return Response(content=full_wav, media_type="audio/wav", headers=headers)
+        except asyncio.CancelledError:
+            audio_streamer.end()
+            raise
+        except Exception:
+            audio_streamer.end()
+            raise
+        finally:
+            audio_streamer.end()
 
     async def stream_generator():
         """
