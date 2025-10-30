@@ -13,6 +13,7 @@ class ApiConfig(BaseSettings):
     model_path: str = Field(...)
     cfg_scale: float = Field(2.0)
     seed: int = Field(42)
+    max_batch_size: int = Field(4)
 
     class Config:
         env_file = dotenv.find_dotenv(usecwd=True)

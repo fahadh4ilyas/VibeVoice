@@ -1,12 +1,14 @@
 # fastapi_stream_wav.py
 import os
 import io
+import time
 import wave
 import asyncio
 import threading
 import traceback
 import timeit
-from typing import Optional, Any, Literal
+from typing import Optional, Any, Literal, List
+from dataclasses import asdict
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -19,7 +21,7 @@ from contextlib import asynccontextmanager
 
 from .config import config, LOGGER_ACCESS, LOGGER
 
-from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
+from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference, VibeVoiceStepOutput
 from vibevoice.modular.lora_loading import load_lora_assets
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 from vibevoice.modular.streamer import AsyncAudioStreamer
@@ -27,17 +29,136 @@ from vibevoice.modular.streamer import AsyncAudioStreamer
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(CURRENT_DIR)
 
+class DataQueue:
+
+    def __init__(self, max_batch_size: int, model: VibeVoiceForConditionalGenerationInference, processor: VibeVoiceProcessor):
+        self.active_queue: List[VibeVoiceStepOutput] = []
+        self.queue: List[VibeVoiceStepOutput] = []
+        self.max_batch_size = max_batch_size
+        self.model = model
+        self.processor = processor
+    
+    def put(self, text: str, lang: str, speaker: str, audio_streamer: AsyncAudioStreamer):
+        full_script = "Speaker 1: " + text
+        voice_sample = voice_list[f"{lang}-{speaker}"].as_posix()
+        inputs = self.processor(
+            text=[full_script], # Wrap in list for batch processing
+            voice_samples=[voice_sample], # Wrap in list for batch processing
+            padding=True,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        item = self.model._init_step_input(
+            **inputs,
+            audio_streamer=audio_streamer,
+            tokenizer=self.processor.tokenizer,
+            max_new_tokens=None,
+            cfg_scale=config.cfg_scale,
+            is_prefill=True,
+            verbose=False,
+            seed=config.seed,
+        )
+        if len(self.active_queue) < self.max_batch_size:
+            self.active_queue.append(item)
+        else:
+            self.queue.append(item)
+    
+    def check_queue(self) -> bool:
+        "remove finished items from active queue, fill from waiting queue, but remove cancelled items first from queue"
+        removed_count = 0
+        for i in range(len(self.active_queue)-1, -1, -1):
+            if self.active_queue[i].finished:
+                self.active_queue.pop(i)
+                removed_count += 1
+        for i in range(len(self.queue)-1, -1, -1):
+            if self.queue[i].finished:
+                self.queue.pop(i)
+        for _ in range(removed_count):
+            if self.queue:
+                item = self.queue.pop(0)
+                self.active_queue.append(item)
+        return len(self.active_queue) > 0
+    
+    @property
+    def is_empty(self):
+        return len(self.active_queue) == 0
+    
+    def log_status(self):
+        LOGGER.info(f"DataQueue status: active={len(self.active_queue)}, waiting={len(self.queue)}")
+
+    def replace_item(self, index: int, item: VibeVoiceStepOutput):
+        if 0 <= index < len(self.active_queue):
+            self.active_queue[index] = item
+    
+    def infinite_loop_step(self):
+        "infinite loop in another thread and the exit if interrupted or get killed"
+
+        log_counter = 0
+        try:
+            while True:
+                now = time.time()
+                if log_counter >= 10.0:
+                    self.log_status()
+                    log_counter = 0
+                if self.is_empty:
+                    time.sleep(0.1)
+                    log_counter += (time.time() - now)
+                    continue
+                self.check_queue()
+                for i in range(len(self.active_queue)):
+                    item = self.active_queue[i]
+                    next_inputs = item.next_inputs
+                    step_output = self.model._single_step_generate(
+                        input_ids=next_inputs.input_ids,
+                        inputs_embeds=next_inputs.inputs_embeds,
+                        model_kwargs=next_inputs.model_kwargs,
+                        negative_input_ids=next_inputs.negative_input_ids,
+                        negative_model_kwargs=next_inputs.negative_model_kwargs,
+                        stop_check_fn=next_inputs.stop_check_fn,
+                        verbose=next_inputs.verbose,
+                        step=next_inputs.step,
+                        max_steps=next_inputs.max_steps,
+                        audio_streamer=next_inputs.audio_streamer,
+                        finished_tags=next_inputs.finished_tags,
+                        progress_bar=next_inputs.progress_bar,
+                        generation_config=next_inputs.generation_config,
+                        batch_size=next_inputs.batch_size,
+                        device=next_inputs.device,
+                        is_prefill=next_inputs.is_prefill,
+                        reach_max_step_sample=next_inputs.reach_max_step_sample,
+                        speech_tensors=next_inputs.speech_tensors,
+                        speech_masks=next_inputs.speech_masks,
+                        speech_input_mask=next_inputs.speech_input_mask,
+                        logits_processor=next_inputs.logits_processor,
+                        max_step_per_sample=next_inputs.max_step_per_sample,
+                        acoustic_cache=next_inputs.acoustic_cache,
+                        semantic_cache=next_inputs.semantic_cache,
+                        correct_cnt=next_inputs.correct_cnt,
+                        cfg_scale=next_inputs.cfg_scale,
+                        audio_chunks=next_inputs.audio_chunks,
+                        refresh_negative=next_inputs.refresh_negative,
+                    )
+                    self.replace_item(i, step_output)
+                torch.cuda.empty_cache()
+                log_counter += (time.time() - now)
+        except KeyboardInterrupt:
+            LOGGER.info("infinite_loop_step interrupted, exiting")
+        except Exception as exc:
+            LOGGER.error(f"infinite_loop_step exception: {traceback.format_exc()}")
+
 executor = ThreadPoolExecutor(max_workers=4)
 
 # --- model placeholders (load your model in startup) ---
 processor: Optional[VibeVoiceProcessor] = None
 model: Optional[VibeVoiceForConditionalGenerationInference] = None
+data_queue: Optional[DataQueue] = None
 lock = threading.Lock()
 voice_list = {p.stem.split('_')[0]: p for p in Path(os.path.join(ROOT_DIR, 'sample-voices')).glob('*.wav')}
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global processor, model
+    global processor, model, data_queue, executor
 
     processor = VibeVoiceProcessor.from_pretrained(config.model_path)
     model = VibeVoiceForConditionalGenerationInference.from_pretrained(
@@ -47,8 +168,12 @@ async def lifespan(app: FastAPI):
     )
     model.eval()
     model.set_ddpm_inference_steps(num_steps=10)
+    data_queue = DataQueue(max_batch_size=config.max_batch_size, model=model, processor=processor)
+    loop = asyncio.get_event_loop()
+    infinite_thread = loop.run_in_executor(executor, data_queue.infinite_loop_step)
     LOGGER.info("Startup: model should be loaded here")
     yield
+    infinite_thread.cancel()
     LOGGER.info("Shutdown: clean up resources if needed")
 
 app = FastAPI(title='Super LLM API',
@@ -174,8 +299,7 @@ async def gen_wav(
     request: Request,
     text: str = Query(...),
     speaker: Literal["alloy", "ash", "echo", "nova"] = Query("alloy"),
-    lang: Literal["en", "id"] = Query('id'),
-    timeout: float = Query(-1)
+    lang: Literal["en", "id"] = Query('id')
 ):
     """
     Streams a TTS response produced by the model.
@@ -184,15 +308,14 @@ async def gen_wav(
     - streaming binary WAV via chunked transfer.
     """
 
-    return await tts_streamer(request, text, speaker, lang, timeout)
+    return await tts_streamer(request, text, speaker, lang)
 
 @app.post("/tts")
 async def generate_wav(
     request: Request,
     text: str = Body(...),
     speaker: Literal["alloy", "ash", "echo", "nova"] = Body("alloy"),
-    lang: Literal["en", "id"] = Body('id'),
-    timeout: float = Body(-1)
+    lang: Literal["en", "id"] = Body('id')
 ):
     """
     Streams a TTS response produced by the model.
@@ -201,23 +324,16 @@ async def generate_wav(
     - streaming binary WAV via chunked transfer.
     """
 
-    return await tts_streamer(request, text, speaker, lang, timeout)
+    return await tts_streamer(request, text, speaker, lang)
 
 async def tts_streamer(
     request: Request,
     text: str,
     speaker: Literal["alloy", "ash", "echo", "nova"],
-    lang: Literal["en", "id"],
-    timeout: float
+    lang: Literal["en", "id"]
 ):
-    global model, processor, executor, lock
+    global processor, model, data_queue
 
-    # Acquire single-call lock so other requests wait
-    if not lock.acquire(timeout=timeout if timeout >= 0 else -1):
-        return ORJSONResponse(
-            {"status": "error", "error": "Another request is in progress. Please try again later."},
-            status_code=429
-        )
     batch_size = 1  # streaming a single sample per request; adapt for batching
     sample_rate = 24000
     num_channels = 1
@@ -225,45 +341,7 @@ async def tts_streamer(
     # instantiate streamer (adjust signature if needed)
     audio_streamer = AsyncAudioStreamer(batch_size=batch_size, timeout=1.0)  # type: ignore
 
-
-    # blocking wrapper to call the synchronous model.generate(...) that writes into audio_streamer
-    def blocking_generate(prompt_text: str):
-        try:
-            full_script = "Speaker 1: " + prompt_text
-            voice_sample = voice_list[f"{lang}-{speaker}"].as_posix()
-            inputs = processor(
-                text=[full_script], # Wrap in list for batch processing
-                voice_samples=[voice_sample], # Wrap in list for batch processing
-                padding=True,
-                return_tensors="pt",
-                return_attention_mask=True,
-            )
-            # for k, v in inputs.items():
-            #     if torch.is_tensor(v):
-            #         inputs[k] = v.to(model.device)
-            model.generate(
-                **inputs,
-                audio_streamer=audio_streamer,
-                tokenizer=processor.tokenizer,
-                max_new_tokens=None,
-                cfg_scale=config.cfg_scale,
-                is_prefill=True,
-                verbose=True,
-                seed=config.seed,
-            )
-            # clear torch cache after generation
-            torch.cuda.empty_cache()
-            return {"status": "ok", "info": "generate finished normally"}
-        except Exception as exc:
-            LOGGER.error(traceback.format_exc())
-            return {"status": "error", "error": str(exc)}
-        finally:
-            audio_streamer.end()
-            lock.release()
-
-    loop = asyncio.get_running_loop()
-    gen_future = loop.run_in_executor(executor, blocking_generate, text)
-
+    data_queue.put(text, lang, speaker, audio_streamer)
 
     async def disconnect_watcher():
         try:
@@ -309,8 +387,6 @@ async def tts_streamer(
                 # let event loop schedule (helps responsiveness)
                 # await asyncio.sleep(0)
 
-            # generation finished normally; await final result from blocking generate
-            gen_result = await gen_future
             # optionally yield small trailing info as text chunk (not part of wav)
             # Many clients will ignore data after WAV; if you want strictly valid WAV only, omit this.
             # We omit extra trailing bytes to keep stream pure WAV.
