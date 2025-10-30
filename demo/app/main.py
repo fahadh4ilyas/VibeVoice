@@ -38,7 +38,15 @@ class DataQueue:
         self.model = model
         self.processor = processor
     
-    def put(self, text: str, lang: str, speaker: str, audio_streamer: AsyncAudioStreamer):
+    def put(
+        self,
+        text: str,
+        lang: str,
+        speaker: str,
+        do_sample: bool,
+        temperature: float,
+        top_p: float,
+        audio_streamer: AsyncAudioStreamer):
         full_script = "Speaker 1: " + text
         voice_sample = voice_list[f"{lang}-{speaker}"].as_posix()
         inputs = self.processor(
@@ -57,6 +65,9 @@ class DataQueue:
             is_prefill=True,
             verbose=False,
             seed=config.seed,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
         )
         if len(self.active_queue) < self.max_batch_size:
             self.active_queue.append(item)
@@ -299,7 +310,10 @@ async def gen_wav(
     request: Request,
     text: str = Query(...),
     speaker: Literal["alloy", "ash", "echo", "nova"] = Query("alloy"),
-    lang: Literal["en", "id"] = Query('id')
+    lang: Literal["en", "id"] = Query('id'),
+    do_sample: bool = Query(True),
+    temperature: float = Query(0.8),
+    top_p: float = Query(0.95)
 ):
     """
     Streams a TTS response produced by the model.
@@ -308,14 +322,17 @@ async def gen_wav(
     - streaming binary WAV via chunked transfer.
     """
 
-    return await tts_streamer(request, text, speaker, lang)
+    return await tts_streamer(request, text, speaker, lang, do_sample, temperature, top_p)
 
 @app.post("/tts")
 async def generate_wav(
     request: Request,
     text: str = Body(...),
     speaker: Literal["alloy", "ash", "echo", "nova"] = Body("alloy"),
-    lang: Literal["en", "id"] = Body('id')
+    lang: Literal["en", "id"] = Body('id'),
+    do_sample: bool = Query(True),
+    temperature: float = Query(0.8),
+    top_p: float = Query(0.95)
 ):
     """
     Streams a TTS response produced by the model.
@@ -324,13 +341,16 @@ async def generate_wav(
     - streaming binary WAV via chunked transfer.
     """
 
-    return await tts_streamer(request, text, speaker, lang)
+    return await tts_streamer(request, text, speaker, lang, do_sample, temperature, top_p)
 
 async def tts_streamer(
     request: Request,
     text: str,
     speaker: Literal["alloy", "ash", "echo", "nova"],
-    lang: Literal["en", "id"]
+    lang: Literal["en", "id"],
+    do_sample: bool,
+    temperature: float,
+    top_p: float
 ):
     global processor, model, data_queue
 
@@ -341,7 +361,7 @@ async def tts_streamer(
     # instantiate streamer (adjust signature if needed)
     audio_streamer = AsyncAudioStreamer(batch_size=batch_size, timeout=1.0)  # type: ignore
 
-    data_queue.put(text, lang, speaker, audio_streamer)
+    data_queue.put(text, lang, speaker, do_sample, temperature, top_p, audio_streamer)
 
     async def disconnect_watcher():
         try:

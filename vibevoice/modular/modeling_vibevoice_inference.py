@@ -52,36 +52,7 @@ class VibeVoiceGenerationOutput(ModelOutput):
 
 @dataclass
 class VibeVoiceNextInputs:
-    """Input type for VibeVoice next token prediction.
-    {
-        "input_ids": input_ids,
-        "inputs_embeds": inputs_embeds,
-        "model_kwargs": model_kwargs,
-        "negative_input_ids": negative_input_ids,
-        "negative_model_kwargs": negative_model_kwargs,
-        "stop_check_fn": stop_check_fn,
-        "verbose": verbose,
-        "step": step + 1,
-        "max_steps": max_steps,
-        "audio_streamer": audio_streamer,
-        "finished_tags": finished_tags,
-        "progress_bar": progress_bar,
-        "generation_config": generation_config,
-        "batch_size": batch_size,
-        "device": device,
-        "reach_max_step_sample": reach_max_step_sample,
-        "speech_tensors": speech_tensors,
-        "speech_masks": speech_masks,
-        "speech_input_mask": speech_input_mask,
-        "logits_processor": logits_processor,
-        "max_step_per_sample": max_step_per_sample,
-        "acoustic_cache": acoustic_cache,
-        "semantic_cache": semantic_cache,
-        "correct_cnt": correct_cnt,
-        "cfg_scale": cfg_scale,
-        "audio_chunks": audio_chunks,
-        "refresh_negative": refresh_negative,
-    }"""
+    """Input type for VibeVoice next token prediction."""
     input_ids: torch.LongTensor
     inputs_embeds: Optional[torch.FloatTensor]
     model_kwargs: Dict[str, torch.Tensor]
