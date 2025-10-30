@@ -520,6 +520,7 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         if step >= max_steps:
             if hasattr(progress_bar, 'set_description'):
                 progress_bar.set_description("Generation complete")
+                progress_bar.close()
             if audio_streamer is not None:
                 audio_streamer.end()
             return VibeVoiceStepOutput(
@@ -531,6 +532,8 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         if stop_check_fn is not None and stop_check_fn():
             if verbose:
                 print(f"Generation stopped externally at step {step + 1}")
+            if hasattr(progress_bar, 'close'):
+                progress_bar.close()
             # End the audio streamer if it exists
             if audio_streamer is not None:
                 audio_streamer.end()
@@ -544,6 +547,8 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
             if any(audio_streamer.finished_flags):
                 if verbose:
                     print(f"Audio generation stopped externally at step {step + 1}")
+                if hasattr(progress_bar, 'close'):
+                    progress_bar.close()
                 return VibeVoiceStepOutput(
                     finished=True,
                     next_inputs=None
@@ -552,6 +557,7 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         if finished_tags.all():
             if hasattr(progress_bar, 'set_description'):
                 progress_bar.set_description("Generation complete")
+                progress_bar.close()
             if audio_streamer is not None:
                 audio_streamer.end()
             return VibeVoiceStepOutput(
@@ -786,6 +792,9 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         
         # Set inputs_embeds for next iteration
         inputs_embeds = next_inputs_embeds
+
+        if hasattr(progress_bar, 'update'):
+            progress_bar.update(1)
 
         return VibeVoiceStepOutput(
             finished=False,
