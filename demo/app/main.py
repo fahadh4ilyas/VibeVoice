@@ -352,7 +352,7 @@ async def tts_streamer(
     temperature: float,
     top_p: float
 ):
-    global processor, model, data_queue
+    global data_queue
 
     batch_size = 1  # streaming a single sample per request; adapt for batching
     sample_rate = 24000
