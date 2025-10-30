@@ -108,7 +108,7 @@ class DataQueue:
         try:
             while True:
                 now = time.time()
-                if log_counter >= 10.0:
+                if log_counter >= 15.0:
                     self.log_status()
                     log_counter = 0
                 if self.is_empty:
@@ -311,9 +311,9 @@ async def gen_wav(
     text: str = Query(...),
     speaker: Literal["alloy", "ash", "echo", "nova"] = Query("alloy"),
     lang: Literal["en", "id"] = Query('id'),
-    do_sample: bool = Query(True),
-    temperature: float = Query(0.8),
-    top_p: float = Query(0.95)
+    do_sample: bool = Query(False),
+    temperature: float = Query(1.0, ge=0.0, le=2.0),
+    top_p: float = Query(1.0, le=1.0, ge=0.0)
 ):
     """
     Streams a TTS response produced by the model.
@@ -330,9 +330,9 @@ async def generate_wav(
     text: str = Body(...),
     speaker: Literal["alloy", "ash", "echo", "nova"] = Body("alloy"),
     lang: Literal["en", "id"] = Body('id'),
-    do_sample: bool = Query(True),
-    temperature: float = Query(0.8),
-    top_p: float = Query(0.95)
+    do_sample: bool = Body(False),
+    temperature: float = Body(1.0, ge=0.0, le=2.0),
+    top_p: float = Body(1.0, le=1.0, ge=0.0)
 ):
     """
     Streams a TTS response produced by the model.
