@@ -38,6 +38,7 @@ class DataQueue:
         self.max_batch_size = max_batch_size
         self.model = model
         self.processor = processor
+        self.stopped = False
     
     def put(
         self,
@@ -110,6 +111,9 @@ class DataQueue:
     def replace_item(self, index: int, item: VibeVoiceStepOutput):
         if 0 <= index < len(self.active_queue):
             self.active_queue[index] = item
+
+    def set_stopped(self, stopped: bool):
+        self.stopped = stopped
     
     def infinite_loop_step(self):
         "infinite loop in another thread and the exit if interrupted or get killed"
@@ -117,6 +121,8 @@ class DataQueue:
         log_counter = 0
         try:
             while True:
+                if self.stopped:
+                    break
                 now = time.time()
                 if log_counter >= 15.0:
                     self.log_status()
@@ -194,7 +200,8 @@ async def lifespan(app: FastAPI):
     infinite_thread = loop.run_in_executor(executor, data_queue.infinite_loop_step)
     LOGGER.info("Startup: model should be loaded here")
     yield
-    infinite_thread.cancel()
+    data_queue.set_stopped(True)
+    await infinite_thread
     LOGGER.info("Shutdown: clean up resources if needed")
 
 app = FastAPI(title='Super LLM API',
@@ -441,9 +448,7 @@ async def tts_streamer(
             full_wav = build_wav_from_pcm(all_pcm, sample_rate, num_channels, sampwidth=2)
             headers = {
                 "Content-Type": "audio/wav",
-                "Content-Length": str(len(full_wav)),
-                # optional: suggest filename for downloads
-                "Content-Disposition": f'attachment; filename="result.wav"'
+                "Content-Length": str(len(full_wav))
             }
             return Response(content=full_wav, media_type="audio/wav", headers=headers)
         except asyncio.CancelledError:
