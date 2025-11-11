@@ -204,8 +204,8 @@ async def lifespan(app: FastAPI):
     await infinite_thread
     LOGGER.info("Shutdown: clean up resources if needed")
 
-app = FastAPI(title='Super LLM API',
-    description='API for generating text using LLM with OpenAI Format',
+app = FastAPI(title='VibeVoice TTS API',
+    description='API for generating speech using VibeVoice model with streaming WAV responses.',
     version='1.0.0',
     lifespan=lifespan)
 
