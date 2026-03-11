@@ -435,6 +435,16 @@ async def remove_voice_sample(
     else:
         return ORJSONResponse({"error": f"Voice sample for {speaker} in {lang} not found."}, status_code=404)
 
+@app.get('/voices')
+async def list_voices():
+    """
+    Lists all available voice samples.
+    """
+    return ORJSONResponse({
+        "object": "list",
+        "data": [{"lang": key.split('-')[0], "speaker": key.split('-')[1]} for key in voice_list.keys()]
+    })
+
 async def tts_streamer(
     request: Request,
     text: str,
