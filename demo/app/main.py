@@ -181,7 +181,8 @@ processor: Optional[VibeVoiceProcessor] = None
 model: Optional[VibeVoiceForConditionalGenerationInference] = None
 data_queue: Optional[DataQueue] = None
 lock = threading.Lock()
-voice_list = {p.stem.split('_')[0]: p for p in Path(os.path.join(ROOT_DIR, 'sample-voices')).glob('*.wav')}
+voice_list = {p.stem.split('_')[0]: p for p in Path(os.path.join(ROOT_DIR, 'sample-voices')).glob("*.wav")}
+voice_list.update({p.stem.split('_')[0]: p for p in Path(os.path.join(ROOT_DIR, 'temp-voices')).glob("*.wav")})
 
 
 @asynccontextmanager
