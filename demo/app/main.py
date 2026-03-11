@@ -60,7 +60,10 @@ class DataQueue:
                 dtype="float32",
             )[0]
         else:
-            voice_sample = voice_list[f"{lang}-{speaker}"].as_posix()
+            if f"{lang}-{speaker}" not in voice_list:
+                voice_sample = Path(os.path.join(ROOT_DIR, 'temp-voices', f"{lang}-{speaker}.wav")).as_posix()
+            else:
+                voice_sample = voice_list[f"{lang}-{speaker}"].as_posix()
         inputs = self.processor(
             text=[full_script], # Wrap in list for batch processing
             voice_samples=[voice_sample], # Wrap in list for batch processing
@@ -182,7 +185,6 @@ model: Optional[VibeVoiceForConditionalGenerationInference] = None
 data_queue: Optional[DataQueue] = None
 lock = threading.Lock()
 voice_list = {p.stem.split('_')[0]: p for p in Path(os.path.join(ROOT_DIR, 'sample-voices')).glob("*.wav")}
-voice_list.update({p.stem.split('_')[0]: p for p in Path(os.path.join(ROOT_DIR, 'temp-voices')).glob("*.wav")})
 
 
 @asynccontextmanager
@@ -413,7 +415,6 @@ async def add_voice_sample(
     async with aiofiles.open(file_path, 'wb') as out_file:
         content = await audio_file.read()
         await out_file.write(content)
-    voice_list[f"{lang}-{speaker}"] = file_path
     return ORJSONResponse({"message": f"Added voice sample for {speaker} in {lang}."})
 
 @app.delete("/remove_voice_sample")
@@ -426,12 +427,11 @@ async def remove_voice_sample(
     Removes a voice sample from the in-memory voice list.
     """
     key = f"{lang}-{speaker}"
-    if key in voice_list and voice_list[key].parent.name == "temp-voices":
+    if Path(os.path.join(ROOT_DIR, 'temp-voices', f"{key}.wav")).exists():
         try:
-            voice_list[key].unlink()
+            Path(os.path.join(ROOT_DIR, 'temp-voices', f"{key}.wav")).unlink()
         except Exception as exc:
             LOGGER.error(f"Error removing voice sample file: {exc}")
-        del voice_list[key]
         return ORJSONResponse({"message": f"Removed voice sample for {speaker} in {lang}."})
     else:
         return ORJSONResponse({"error": f"Voice sample for {speaker} in {lang} not found."}, status_code=404)
@@ -443,7 +443,7 @@ async def list_voices():
     """
     return ORJSONResponse({
         "object": "list",
-        "data": [{"lang": key.split('-')[0], "speaker": key.split('-')[1]} for key in voice_list.keys()]
+        "data": [{"lang": key.split('-')[0], "speaker": key.split('-')[1]} for key in voice_list.keys()] + [{"lang": p.stem.split('-')[0], "speaker": p.stem.split('-')[1]} for p in Path(os.path.join(ROOT_DIR, 'temp-voices')).glob("*.wav")]
     })
 
 async def tts_streamer(
@@ -463,7 +463,7 @@ async def tts_streamer(
     sample_rate = 24000
     num_channels = 1
 
-    if f"{lang}-{speaker}" not in voice_list and audio_base64 is None:
+    if f"{lang}-{speaker}" not in voice_list and not Path(os.path.join(ROOT_DIR, 'temp-voices', f"{lang}-{speaker}.wav")).exists() and audio_base64 is None:
         return ORJSONResponse({"error": f"Speaker '{speaker}' not found for language '{lang}'."}, status_code=404)
 
     # instantiate streamer (adjust signature if needed)
