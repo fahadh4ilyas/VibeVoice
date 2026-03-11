@@ -4,16 +4,17 @@ import io
 import time
 import wave
 import asyncio
+import aiofiles
 import threading
 import traceback
 import timeit
 import base64
-from typing import Optional, Any, Literal, List
+from typing import Optional, Any, Literal, List, Dict, Union
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, Request, Body, Query, Form, File, UploadFile
-from fastapi.responses import StreamingResponse, ORJSONResponse, Response, RedirectResponse
+from fastapi.responses import StreamingResponse, ORJSONResponse, Response, RedirectResponse, FileResponse
 
 import torch
 import numpy as np
@@ -338,11 +339,11 @@ def chunk_to_pcm16_bytes(chunk: Any, num_channels: int) -> bytes:
     return int16.tobytes()
 
 
-@app.get("/tts")
+@app.get("/tts", response_class=FileResponse)
 async def gen_wav(
     request: Request,
     text: str = Query(...),
-    speaker: Literal["alloy", "ash", "echo", "nova"] = Query("alloy"),
+    speaker: str = Query("alloy"),
     lang: Literal["en", "id"] = Query('id'),
     do_sample: bool = Query(False),
     temperature: float = Query(1.0, ge=0.0, le=2.0),
@@ -358,11 +359,11 @@ async def gen_wav(
 
     return await tts_streamer(request, text, None, speaker, lang, do_sample, temperature, top_p, do_stream)
 
-@app.post("/tts")
+@app.post("/tts", response_class=FileResponse)
 async def generate_wav(
     request: Request,
     text: str = Body(...),
-    speaker: Literal["alloy", "ash", "echo", "nova"] = Body("alloy"),
+    speaker: str = Body("alloy"),
     lang: Literal["en", "id"] = Body('id'),
     do_sample: bool = Body(False),
     temperature: float = Body(1.0, ge=0.0, le=2.0),
@@ -378,7 +379,7 @@ async def generate_wav(
 
     return await tts_streamer(request, text, None, speaker, lang, do_sample, temperature, top_p, do_stream)
 
-@app.post("/voice_clone")
+@app.post("/voice_clone", response_class=FileResponse)
 async def voice_clone_form(
     request: Request,
     text: str = Form(...),
@@ -395,11 +396,50 @@ async def voice_clone_form(
     audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
     return await tts_streamer(request, text, audio_base64, "alloy", "id", do_sample, temperature, top_p, do_stream)
 
+@app.post("/add_voice_sample")
+async def add_voice_sample(
+    request: Request,
+    lang: Literal["en", "id"] = Body(...),
+    speaker: str = Body(...),
+    audio_file: UploadFile = File(...)
+):
+    """
+    Adds a new voice sample to the in-memory voice list for cloning.
+    """
+    temp_dir = Path(os.path.join(ROOT_DIR, 'temp-voices'))
+    temp_dir.mkdir(exist_ok=True)
+    file_path = temp_dir / f"{lang}-{speaker}.wav"
+    async with aiofiles.open(file_path, 'wb') as out_file:
+        content = await audio_file.read()
+        await out_file.write(content)
+    voice_list[f"{lang}-{speaker}"] = file_path
+    return ORJSONResponse({"message": f"Added voice sample for {speaker} in {lang}."})
+
+@app.delete("/remove_voice_sample")
+async def remove_voice_sample(
+    request: Request,
+    lang: Literal["en", "id"] = Query(...),
+    speaker: str = Query(...)
+):
+    """
+    Removes a voice sample from the in-memory voice list.
+    """
+    key = f"{lang}-{speaker}"
+    if key in voice_list and voice_list[key].parent.name == "temp-voices":
+        try:
+            voice_list[key].unlink()
+        except Exception as exc:
+            LOGGER.error(f"Error removing voice sample file: {exc}")
+        del voice_list[key]
+        return ORJSONResponse({"message": f"Removed voice sample for {speaker} in {lang}."})
+    else:
+        return ORJSONResponse({"error": f"Voice sample for {speaker} in {lang} not found."}, status_code=404)
+
 async def tts_streamer(
     request: Request,
     text: str,
     audio_base64: Optional[str],
-    speaker: Literal["alloy", "ash", "echo", "nova"],
+    speaker: str,
     lang: Literal["en", "id"],
     do_sample: bool,
     temperature: float,
@@ -411,6 +451,9 @@ async def tts_streamer(
     batch_size = 1  # streaming a single sample per request; adapt for batching
     sample_rate = 24000
     num_channels = 1
+
+    if f"{lang}-{speaker}" not in voice_list and audio_base64 is None:
+        return ORJSONResponse({"error": f"Speaker '{speaker}' not found for language '{lang}'."}, status_code=404)
 
     # instantiate streamer (adjust signature if needed)
     audio_streamer = AsyncAudioStreamer(batch_size=batch_size, timeout=1.0)  # type: ignore
