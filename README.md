@@ -34,6 +34,7 @@ Fine-tuning is now supported, which is incredibly powerful. You can adapt VibeVo
 
 ## Updates
 
+- **[2026-06-12]** [Unofficial voice cloning](https://huggingface.co/mohammed-bahumaish/vibevoice-realtime-0.5b-with-encoder) for Streaming/Realtime model released by community member
 - **[2025-12-04]** Added support for VibeVoice-Streaming-0.5B model for real-time TTS!
 - **[2025-09-05]** Microsoft repo restored (without code) with statement about responsible AI use.
 - **[2025-09-04]** Community backup created after Microsoft removed original repo and models.
@@ -56,7 +57,7 @@ Fine-tuning is now supported, which is incredibly powerful. You can adapt VibeVo
 
 ### Model Comparison
 
-- **VibeVoice-Streaming-0.5B**: Optimized for **real-time** low-latency TTS. Single speaker only. Uses pre-computed voice embeddings (.pt files) for fast inference. Best for live applications.
+- **VibeVoice-Streaming-0.5B**: Optimized for **real-time** low-latency TTS. Single speaker only. Uses pre-computed voice embeddings (.pt files) for fast inference. Best for live applications. [Unofficial voice cloning](https://huggingface.co/mohammed-bahumaish/vibevoice-realtime-0.5b-with-encoder)
 - **VibeVoice-1.5B/7B**: Full-featured models for **long-form multi-speaker** content like podcasts. Support up to 4 speakers with voice cloning from audio samples.
 
 ## Installation
