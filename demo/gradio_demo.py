@@ -19,6 +19,7 @@ import soundfile as sf
 import torch
 import os
 import traceback
+import re
 
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
@@ -210,6 +211,8 @@ class VibeVoiceDemo:
                                  speaker_3: str = None,
                                  speaker_4: str = None,
                                  cfg_scale: float = 1.3,
+                                 inference_steps: Optional[int] = None,
+                                 seed: Optional[int] = None,
                                  disable_voice_cloning: bool = False) -> Iterator[tuple]:
         try:
             
@@ -240,9 +243,37 @@ class VibeVoiceDemo:
             
             voice_cloning_enabled = not disable_voice_cloning
 
+            # Resolve per-run parameters
+            resolved_inference_steps = int(inference_steps) if inference_steps is not None else int(self.inference_steps)
+            resolved_seed: Optional[int]
+            if seed is None:
+                resolved_seed = None
+            else:
+                # Gradio Number may come through as float
+                resolved_seed = int(seed)
+                if resolved_seed < 0:
+                    resolved_seed = None
+
+            def _sanitize_filename_part(value: str, max_len: int = 60) -> str:
+                value = (value or "").strip()
+                value = re.sub(r"\s+", "_", value)
+                value = re.sub(r"[^A-Za-z0-9_\-\+\.]+", "", value)
+                return value[:max_len] if len(value) > max_len else value
+
+            def _write_complete_wav(audio_int16: np.ndarray, sample_rate: int = 24000) -> str:
+                ts = datetime.now().strftime("%Y%m%d%H%M%S")
+                speakers_part = _sanitize_filename_part("-".join(selected_speakers) if selected_speakers else "speaker")
+                cfg_part = _sanitize_filename_part(f"{cfg_scale:.2f}")
+                seed_part = str(resolved_seed) if resolved_seed is not None else "rand"
+                # Requested pattern: yyyyMMddhhmmss_[speaker]_[cfg_scale]_[inference_step][seed].wav
+                basename = f"{ts}_{speakers_part}_{cfg_part}_{resolved_inference_steps}_{seed_part}.wav"
+                out_path = os.path.join(tempfile.gettempdir(), basename)
+                sf.write(out_path, np.asarray(audio_int16, dtype=np.int16), sample_rate, subtype="PCM_16")
+                return out_path
+
             # Build initial log
             log = f"🎙️ Generating podcast with {num_speakers} speakers\n"
-            log += f"📊 Parameters: CFG Scale={cfg_scale}, Inference Steps={self.inference_steps}\n"
+            log += f"📊 Parameters: CFG Scale={cfg_scale}, Inference Steps={resolved_inference_steps}, Seed={(resolved_seed if resolved_seed is not None else 'random')}\n"
             log += f"🎭 Speakers: {', '.join(selected_speakers)}\n"
             log += f"🔊 Voice cloning: {'Enabled' if voice_cloning_enabled else 'Disabled'}\n"
             if self.loaded_adapter_root:
@@ -331,7 +362,7 @@ class VibeVoiceDemo:
             # Start generation in a separate thread
             generation_thread = threading.Thread(
                 target=self._generate_with_streamer,
-                args=(inputs, cfg_scale, audio_streamer, voice_cloning_enabled)
+                args=(inputs, cfg_scale, audio_streamer, voice_cloning_enabled, resolved_inference_steps, resolved_seed, target_device)
             )
             generation_thread.start()
             
@@ -465,8 +496,9 @@ class VibeVoiceDemo:
                 final_log += "✨ Generation successful! Complete audio is ready.\n"
                 final_log += "💡 Not satisfied? You can regenerate or adjust the CFG scale for different results."
                 
-                # Yield the complete audio
-                yield None, (sample_rate, complete_audio), final_log, gr.update(visible=False)
+                # Yield the complete audio as a filepath so download uses our filename
+                complete_wav_path = _write_complete_wav(complete_audio, sample_rate=sample_rate)
+                yield None, complete_wav_path, final_log, gr.update(visible=False)
                 return
             
             if not has_received_chunks:
@@ -490,8 +522,9 @@ class VibeVoiceDemo:
                 final_log += "✨ Generation successful! Complete audio is ready in the 'Complete Audio' tab.\n"
                 final_log += "💡 Not satisfied? You can regenerate or adjust the CFG scale for different results."
                 
-                # Final yield: Clear streaming audio and provide complete audio
-                yield None, (sample_rate, complete_audio), final_log, gr.update(visible=False)
+                # Final yield: Clear streaming audio and provide complete audio as filepath
+                complete_wav_path = _write_complete_wav(complete_audio, sample_rate=sample_rate)
+                yield None, complete_wav_path, final_log, gr.update(visible=False)
             else:
                 final_log = log + "❌ No audio was generated."
                 yield None, None, final_log, gr.update(visible=False)
@@ -513,17 +546,44 @@ class VibeVoiceDemo:
             traceback.print_exc()
             yield None, None, error_msg, gr.update(visible=False)
     
-    def _generate_with_streamer(self, inputs, cfg_scale, audio_streamer, voice_cloning_enabled: bool):
+    def _generate_with_streamer(
+        self,
+        inputs,
+        cfg_scale,
+        audio_streamer,
+        voice_cloning_enabled: bool,
+        inference_steps: int,
+        seed: Optional[int],
+        target_device: str,
+    ):
         """Helper method to run generation with streamer in a separate thread."""
         try:
             # Check for stop signal before starting generation
             if self.stop_generation:
                 audio_streamer.end()
                 return
+
+            # Apply per-run DDPM steps
+            try:
+                self.model.set_ddpm_inference_steps(num_steps=int(inference_steps))
+            except Exception as e:
+                print(f"Warning: failed to set inference steps ({inference_steps}): {e}")
                 
             # Define a stop check function that can be called from generate
             def check_stop_generation():
                 return self.stop_generation
+
+            generator = None
+            if seed is not None:
+                try:
+                    if target_device == "cuda":
+                        generator = torch.Generator(device="cuda")
+                    else:
+                        generator = torch.Generator()
+                    generator.manual_seed(int(seed))
+                except Exception as e:
+                    print(f"Warning: failed to create seeded generator (seed={seed}, device={target_device}): {e}")
+                    generator = None
                 
             outputs = self.model.generate(
                 **inputs,
@@ -533,6 +593,7 @@ class VibeVoiceDemo:
                 generation_config={
                     'do_sample': False,
                 },
+                generator=generator,
                 audio_streamer=audio_streamer,
                 stop_check_fn=check_stop_generation,  # Pass the stop check function
                 verbose=False,  # Disable verbose in streaming mode
@@ -639,227 +700,17 @@ class VibeVoiceDemo:
 def create_demo_interface(demo_instance: VibeVoiceDemo):
     """Create the Gradio interface with streaming support."""
     
-    # Custom CSS for high-end aesthetics with lighter theme
-    custom_css = """
-    /* Modern light theme with gradients */
-    .gradio-container {
-        background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
-        font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
-    }
-    
-    /* Header styling */
-    .main-header {
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-        padding: 2rem;
-        border-radius: 20px;
-        margin-bottom: 2rem;
-        text-align: center;
-        box-shadow: 0 10px 40px rgba(102, 126, 234, 0.3);
-    }
-    
-    .main-header h1 {
-        color: white;
-        font-size: 2.5rem;
-        font-weight: 700;
-        margin: 0;
-        text-shadow: 0 2px 4px rgba(0,0,0,0.3);
-    }
-    
-    .main-header p {
-        color: rgba(255,255,255,0.9);
-        font-size: 1.1rem;
-        margin: 0.5rem 0 0 0;
-    }
-    
-    /* Card styling */
-    .settings-card, .generation-card {
-        background: rgba(255, 255, 255, 0.8);
-        backdrop-filter: blur(10px);
-        border: 1px solid rgba(226, 232, 240, 0.8);
-        border-radius: 16px;
-        padding: 1.5rem;
-        margin-bottom: 1rem;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
-    }
-    
-    /* Speaker selection styling */
-    .speaker-grid {
-        display: grid;
-        gap: 1rem;
-        margin-bottom: 1rem;
-    }
-    
-    .speaker-item {
-        background: linear-gradient(135deg, #e2e8f0 0%, #cbd5e1 100%);
-        border: 1px solid rgba(148, 163, 184, 0.4);
-        border-radius: 12px;
-        padding: 1rem;
-        color: #374151;
-        font-weight: 500;
-    }
-    
-    /* Streaming indicator */
-    .streaming-indicator {
-        display: inline-block;
-        width: 10px;
-        height: 10px;
-        background: #22c55e;
-        border-radius: 50%;
-        margin-right: 8px;
-        animation: pulse 1.5s infinite;
-    }
-    
-    @keyframes pulse {
-        0% { opacity: 1; transform: scale(1); }
-        50% { opacity: 0.5; transform: scale(1.1); }
-        100% { opacity: 1; transform: scale(1); }
-    }
-    
-    /* Queue status styling */
-    .queue-status {
-        background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
-        border: 1px solid rgba(14, 165, 233, 0.3);
-        border-radius: 8px;
-        padding: 0.75rem;
-        margin: 0.5rem 0;
-        text-align: center;
-        font-size: 0.9rem;
-        color: #0369a1;
-    }
-    
-    .generate-btn {
-        background: linear-gradient(135deg, #059669 0%, #0d9488 100%);
-        border: none;
-        border-radius: 12px;
-        padding: 1rem 2rem;
-        color: white;
-        font-weight: 600;
-        font-size: 1.1rem;
-        box-shadow: 0 4px 20px rgba(5, 150, 105, 0.4);
-        transition: all 0.3s ease;
-    }
-    
-    .generate-btn:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 25px rgba(5, 150, 105, 0.6);
-    }
-    
-    .stop-btn {
-        background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
-        border: none;
-        border-radius: 12px;
-        padding: 1rem 2rem;
-        color: white;
-        font-weight: 600;
-        font-size: 1.1rem;
-        box-shadow: 0 4px 20px rgba(239, 68, 68, 0.4);
-        transition: all 0.3s ease;
-    }
-    
-    .stop-btn:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 25px rgba(239, 68, 68, 0.6);
-    }
-    
-    /* Audio player styling */
-    .audio-output {
-        background: linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%);
-        border-radius: 16px;
-        padding: 1.5rem;
-        border: 1px solid rgba(148, 163, 184, 0.3);
-    }
-    
-    .complete-audio-section {
-        margin-top: 1rem;
-        padding: 1rem;
-        background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
-        border: 1px solid rgba(34, 197, 94, 0.3);
-        border-radius: 12px;
-    }
-    
-    /* Text areas */
-    .script-input, .log-output {
-        background: rgba(255, 255, 255, 0.9) !important;
-        border: 1px solid rgba(148, 163, 184, 0.4) !important;
-        border-radius: 12px !important;
-        color: #1e293b !important;
-        font-family: 'JetBrains Mono', monospace !important;
-    }
-    
-    .script-input::placeholder {
-        color: #64748b !important;
-    }
-    
-    /* Sliders */
-    .slider-container {
-        background: rgba(248, 250, 252, 0.8);
-        border: 1px solid rgba(226, 232, 240, 0.6);
-        border-radius: 8px;
-        padding: 1rem;
-        margin: 0.5rem 0;
-    }
-    
-    /* Labels and text */
-    .gradio-container label {
-        color: #374151 !important;
-        font-weight: 600 !important;
-    }
-    
-    .gradio-container .markdown {
-        color: #1f2937 !important;
-    }
-    
-    /* Responsive design */
-    @media (max-width: 768px) {
-        .main-header h1 { font-size: 2rem; }
-        .settings-card, .generation-card { padding: 1rem; }
-    }
-    
-    /* Random example button styling - more subtle professional color */
-    .random-btn {
-        background: linear-gradient(135deg, #64748b 0%, #475569 100%);
-        border: none;
-        border-radius: 12px;
-        padding: 1rem 1.5rem;
-        color: white;
-        font-weight: 600;
-        font-size: 1rem;
-        box-shadow: 0 4px 20px rgba(100, 116, 139, 0.3);
-        transition: all 0.3s ease;
-        display: inline-flex;
-        align-items: center;
-        gap: 0.5rem;
-    }
-    
-    .random-btn:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 25px rgba(100, 116, 139, 0.4);
-        background: linear-gradient(135deg, #475569 0%, #334155 100%);
-    }
-    """
-    
-    with gr.Blocks(
-        title="VibeVoice - AI Podcast Generator",
-        css=custom_css,
-        theme=gr.themes.Soft(
-            primary_hue="blue",
-            secondary_hue="purple",
-            neutral_hue="slate",
-        )
-    ) as interface:
+    with gr.Blocks() as interface:
         
         # Header
         gr.HTML("""
-        <div class="main-header">
-            <h1>🎙️ Vibe Podcasting </h1>
-            <p>Generating Long-form Multi-speaker AI Podcast with VibeVoice</p>
-        </div>
+        # VibeVoice
         """)
         
         with gr.Row():
             # Left column - Settings
             with gr.Column(scale=1, elem_classes="settings-card"):
-                gr.Markdown("### 🎛️ **Podcast Settings**")
+                gr.Markdown("### **Podcast Settings**")
                 
                 # Number of speakers
                 num_speakers = gr.Slider(
@@ -897,12 +748,25 @@ def create_demo_interface(demo_instance: VibeVoiceDemo):
                 with gr.Accordion("Generation Parameters", open=False):
                     cfg_scale = gr.Slider(
                         minimum=1.0,
-                        maximum=2.0,
+                        maximum=12.0,
                         value=1.3,
                         step=0.05,
                         label="CFG Scale (Guidance Strength)",
                         # info="Higher values increase adherence to text",
                         elem_classes="slider-container"
+                    )
+                    inference_steps = gr.Slider(
+                        minimum=1,
+                        maximum=50,
+                        value=int(getattr(demo_instance, "inference_steps", 10)),
+                        step=1,
+                        label="Inference Steps",
+                        elem_classes="slider-container",
+                    )
+                    seed = gr.Number(
+                        value=42,
+                        precision=0,
+                        label="Seed (-1 = random)",
                     )
                     disable_voice_cloning = gr.Checkbox(
                         value=False,
@@ -992,7 +856,7 @@ Or paste text directly and it will auto-assign speakers.""",
                 # Complete audio output (non-streaming)
                 complete_audio_output = gr.Audio(
                     label="Complete Podcast (Download after generation)",
-                    type="numpy",
+                    type="filepath",
                     elem_classes="audio-output complete-audio-section",
                     streaming=False,  # Non-streaming mode
                     autoplay=False,
@@ -1027,7 +891,7 @@ Or paste text directly and it will auto-assign speakers.""",
         )
         
         # Main generation function with streaming
-        def generate_podcast_wrapper(num_speakers, script, speaker_1, speaker_2, speaker_3, speaker_4, cfg_scale, disable_voice_cloning):
+        def generate_podcast_wrapper(num_speakers, script, speaker_1, speaker_2, speaker_3, speaker_4, cfg_scale, inference_steps, seed, disable_voice_cloning):
             """Wrapper function to handle the streaming generation call."""
             try:
                 speakers = [speaker_1, speaker_2, speaker_3, speaker_4]
@@ -1046,6 +910,8 @@ Or paste text directly and it will auto-assign speakers.""",
                     speaker_3=speakers[2],
                     speaker_4=speakers[3],
                     cfg_scale=cfg_scale,
+                    inference_steps=inference_steps,
+                    seed=seed,
                     disable_voice_cloning=disable_voice_cloning
                 ):
                     final_log = log
@@ -1094,7 +960,7 @@ Or paste text directly and it will auto-assign speakers.""",
             queue=False
         ).then(
             fn=generate_podcast_wrapper,
-            inputs=[num_speakers, script_input] + speaker_selections + [cfg_scale, disable_voice_cloning],
+            inputs=[num_speakers, script_input] + speaker_selections + [cfg_scale, inference_steps, seed, disable_voice_cloning],
             outputs=[audio_output, complete_audio_output, log_output, streaming_status, generate_btn, stop_btn],
             queue=True  # Enable Gradio's built-in queue
         )
