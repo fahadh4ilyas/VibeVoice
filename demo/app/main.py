@@ -3,6 +3,8 @@ import os
 import io
 import time
 import wave
+import json
+import shutil
 import asyncio
 import aiofiles
 import threading
@@ -13,7 +15,7 @@ from typing import Optional, Any, Literal, List, Dict, Union
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, Request, Body, Query, Form, File, UploadFile
+from fastapi import FastAPI, Request, Body, Query, Form, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, ORJSONResponse, Response, RedirectResponse, FileResponse
 
 import torch
@@ -30,6 +32,175 @@ from vibevoice.modular.streamer import AsyncAudioStreamer
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(CURRENT_DIR)
+
+# --- Voice management system ---
+# Each uploaded voice is stored as two files in VOICES_DIR:
+#   {name}.wav  — the audio sample
+#   {name}.json — per-voice metadata (avoids multi-worker contention on a single file)
+# Built-in voices (voices/, sample-voices/) are read-only and have no sidecar JSON.
+VOICES_DIR = Path(os.environ.get("SPEAKER_SAMPLES_DIR", os.path.join(ROOT_DIR, "uploaded-voices")))
+MAX_UPLOADED_VOICES = int(os.environ.get("SPEAKER_MAX_UPLOADED", "1000"))
+
+
+def _voice_metadata_path(name: str) -> Path:
+    return VOICES_DIR / f"{name}.json"
+
+
+def _voice_wav_path(name: str) -> Path:
+    return VOICES_DIR / f"{name}.wav"
+
+
+def _read_voice_metadata(name: str) -> Optional[dict]:
+    """Read a single voice's metadata JSON. Returns None if missing or corrupt."""
+    path = _voice_metadata_path(name)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        LOGGER.warning(f"Corrupt metadata for voice '{name}', ignoring")
+        return None
+
+
+def _write_voice_metadata(name: str, info: dict) -> None:
+    """Atomically write per-voice metadata JSON (write-tmp + rename)."""
+    VOICES_DIR.mkdir(parents=True, exist_ok=True)
+    path = _voice_metadata_path(name)
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(info, f, indent=2)
+    os.replace(tmp, path)  # atomic on POSIX
+
+
+def _load_uploaded_voices_metadata() -> Dict[str, dict]:
+    """Scan VOICES_DIR for *.json sidecars and return {name: metadata}."""
+    if not VOICES_DIR.is_dir():
+        return {}
+    result: Dict[str, dict] = {}
+    for json_file in sorted(VOICES_DIR.glob("*.json")):
+        name = json_file.stem
+        info = _read_voice_metadata(name)
+        if info is not None:
+            # Only include if the WAV file also exists
+            if _voice_wav_path(name).exists():
+                result[name] = info
+            else:
+                LOGGER.warning(f"Uploaded voice '{name}': metadata exists but WAV file missing, skipping")
+    return result
+
+
+def _get_builtin_voices() -> Dict[str, Path]:
+    """Scan built-in voice directories and return {name: path} mapping."""
+    builtin: Dict[str, Path] = {}
+    for scan_dir in [
+        Path(os.path.join(ROOT_DIR, "voices")),
+        Path(os.path.join(ROOT_DIR, "sample-voices")),
+    ]:
+        if scan_dir.is_dir():
+            for wav_file in scan_dir.glob("*.wav"):
+                name = wav_file.stem  # e.g. "en-Alice_woman"
+                builtin[name] = wav_file
+    return builtin
+
+
+def _get_uploaded_voices() -> Dict[str, Path]:
+    """Return currently uploaded voices with their file paths from disk."""
+    uploaded: Dict[str, Path] = {}
+    for name, info in _load_uploaded_voices_metadata().items():
+        wav_path = _voice_wav_path(name)
+        if wav_path.exists():
+            uploaded[name] = wav_path
+    return uploaded
+
+
+def _get_all_available_voices() -> Dict[str, Path]:
+    """Combine built-in and uploaded voices. Uploaded voices take precedence over built-in."""
+    voices = _get_builtin_voices()
+    voices.update(_get_uploaded_voices())
+    return voices
+
+
+def _count_uploaded_voices() -> int:
+    """Count current uploaded voices (by scanning *.json sidecars)."""
+    if not VOICES_DIR.is_dir():
+        return 0
+    return len(list(VOICES_DIR.glob("*.json")))
+
+
+def _upload_voice(name: str, audio_bytes: bytes, consent: str,
+                  ref_text: Optional[str] = None,
+                  speaker_description: Optional[str] = None) -> dict:
+    """Save an uploaded voice to disk with per-file metadata. Returns the voice info dict."""
+    existing_count = _count_uploaded_voices()
+    existing_meta = _read_voice_metadata(name)
+    if existing_count >= MAX_UPLOADED_VOICES and existing_meta is None:
+        raise ValueError(f"Maximum number of uploaded voices ({MAX_UPLOADED_VOICES}) reached")
+
+    if existing_meta is not None:
+        LOGGER.warning(f"Overwriting existing uploaded voice '{name}'")
+
+    VOICES_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Write WAV atomically (tmp + rename)
+    wav_path = _voice_wav_path(name)
+    wav_tmp = wav_path.with_suffix(".wav.tmp")
+    wav_tmp.write_bytes(audio_bytes)
+    os.replace(wav_tmp, wav_path)
+
+    now = int(time.time())
+    info: dict = {
+        "name": name,
+        "consent": consent,
+        "created_at": now,
+        "file_size": len(audio_bytes),
+        "mime_type": "audio/wav",
+    }
+    if ref_text:
+        info["ref_text"] = ref_text
+    if speaker_description:
+        info["speaker_description"] = speaker_description
+
+    # Write JSON atomically (tmp + rename) — this is the "committed" marker
+    _write_voice_metadata(name, info)
+
+    # Reload voice_list to include the new upload
+    _reload_voice_list()
+
+    return info
+
+
+def _delete_voice(name: str) -> None:
+    """Delete an uploaded voice (both WAV and JSON sidecar)."""
+    meta_path = _voice_metadata_path(name)
+    wav_path = _voice_wav_path(name)
+
+    if not meta_path.exists() and not wav_path.exists():
+        raise FileNotFoundError(f"Voice '{name}' not found")
+
+    # Remove JSON first (marks as deleted), then WAV
+    if meta_path.exists():
+        meta_path.unlink()
+    if wav_path.exists():
+        wav_path.unlink()
+
+    # Reload voice_list
+    _reload_voice_list()
+
+# Global voice_list — used by tts_streamer to resolve speaker names to audio file paths.
+# Uploaded voices take precedence over built-in ones.
+voice_list: Dict[str, Path] = {}
+uploaded_voices_metadata: Dict[str, dict] = {}
+
+
+def _reload_voice_list() -> None:
+    """Reload the voice_list from disk. Called after uploads/deletes."""
+    global voice_list, uploaded_voices_metadata
+    voice_list = _get_all_available_voices()
+    uploaded_voices_metadata = _load_uploaded_voices_metadata()
+
+
+_reload_voice_list()
 
 class DataQueue:
 
@@ -60,10 +231,21 @@ class DataQueue:
                 dtype="float32",
             )[0]
         else:
-            if f"{lang}-{speaker}" not in voice_list:
-                voice_sample = Path(os.path.join(ROOT_DIR, 'temp-voices', f"{lang}-{speaker}.wav")).as_posix()
+            # Resolve voice: try direct match in voice_list first, then lang-speaker combo
+            voice_path = None
+            if speaker in voice_list:
+                voice_path = voice_list[speaker]
+            elif f"{lang}-{speaker}" in voice_list:
+                voice_path = voice_list[f"{lang}-{speaker}"]
             else:
-                voice_sample = voice_list[f"{lang}-{speaker}"].as_posix()
+                # Try partial match: any key containing the speaker name
+                for key in voice_list:
+                    if speaker.lower() in key.lower():
+                        voice_path = voice_list[key]
+                        break
+            if voice_path is None:
+                raise ValueError(f"Voice '{speaker}' not found for language '{lang}'")
+            voice_sample = voice_path
         inputs = self.processor(
             text=[full_script], # Wrap in list for batch processing
             voice_samples=[voice_sample], # Wrap in list for batch processing
@@ -184,7 +366,6 @@ processor: Optional[VibeVoiceProcessor] = None
 model: Optional[VibeVoiceForConditionalGenerationInference] = None
 data_queue: Optional[DataQueue] = None
 lock = threading.Lock()
-voice_list = {p.stem.split('_')[0]: p for p in Path(os.path.join(ROOT_DIR, 'sample-voices')).glob("*.wav")}
 
 
 @asynccontextmanager
@@ -407,14 +588,19 @@ async def add_voice_sample(
     audio_file: UploadFile = File(...)
 ):
     """
-    Adds a new voice sample to the in-memory voice list for cloning.
+    Adds a new voice sample to the voice list for cloning.
+    Uses the unified uploaded-voices directory.
     """
-    temp_dir = Path(os.path.join(ROOT_DIR, 'temp-voices'))
-    temp_dir.mkdir(exist_ok=True)
-    file_path = temp_dir / f"{lang}-{speaker}.wav"
-    async with aiofiles.open(file_path, 'wb') as out_file:
-        content = await audio_file.read()
-        await out_file.write(content)
+    name = f"{lang}-{speaker}"
+    audio_bytes = await audio_file.read()
+    try:
+        _upload_voice(
+            name=name,
+            audio_bytes=audio_bytes,
+            consent="legacy",
+        )
+    except ValueError as exc:
+        return ORJSONResponse({"error": str(exc)}, status_code=400)
     return ORJSONResponse({"message": f"Added voice sample for {speaker} in {lang}."})
 
 @app.delete("/remove_voice_sample")
@@ -424,16 +610,14 @@ async def remove_voice_sample(
     speaker: str = Query(...)
 ):
     """
-    Removes a voice sample from the in-memory voice list.
+    Removes a voice sample from the voice list.
+    Uses the unified uploaded-voices directory.
     """
-    key = f"{lang}-{speaker}"
-    if Path(os.path.join(ROOT_DIR, 'temp-voices', f"{key}.wav")).exists():
-        try:
-            Path(os.path.join(ROOT_DIR, 'temp-voices', f"{key}.wav")).unlink()
-        except Exception as exc:
-            LOGGER.error(f"Error removing voice sample file: {exc}")
+    name = f"{lang}-{speaker}"
+    try:
+        _delete_voice(name)
         return ORJSONResponse({"message": f"Removed voice sample for {speaker} in {lang}."})
-    else:
+    except FileNotFoundError:
         return ORJSONResponse({"error": f"Voice sample for {speaker} in {lang} not found."}, status_code=404)
 
 @app.get('/voices')
@@ -443,8 +627,341 @@ async def list_voices():
     """
     return ORJSONResponse({
         "object": "list",
-        "data": [{"lang": key.split('-')[0], "speaker": key.split('-')[1]} for key in voice_list.keys()] + [{"lang": p.stem.split('-')[0], "speaker": p.stem.split('-')[1]} for p in Path(os.path.join(ROOT_DIR, 'temp-voices')).glob("*.wav")]
+        "data": [{"lang": key.split('-')[0], "speaker": key.split('-')[1]} for key in voice_list.keys()],
     })
+
+
+# =============================================================================
+# OpenAI-compatible /v1/audio API endpoints
+# =============================================================================
+
+@app.post("/v1/audio/speech")
+async def generate_speech(
+    request: Request,
+    body: Dict[str, Any] = Body(...),
+):
+    """
+    OpenAI-compatible text-to-speech endpoint.
+    Generates audio from the input text with the specified voice.
+
+    Request body (JSON):
+        - input (str, required): The text to synthesize into speech.
+        - model (str, optional): Model to use. Ignored — server runs one model.
+        - voice (str, optional): Speaker name. Defaults to "alloy".
+        - response_format (str, optional): Audio format: wav, mp3, flac, pcm. Default "wav".
+        - speed (float, optional): Playback speed (0.25-4.0). Default 1.0.
+        - language (str, optional): Language code (e.g. "en", "id"). Default "en".
+        - instructions (str, optional): Voice style/emotion instructions (not used by VibeVoice).
+    """
+    text = body.get("input", "").strip()
+    if not text:
+        return ORJSONResponse({
+            "error": {"message": "Input text cannot be empty", "type": "BadRequestError", "param": "input", "code": 400}
+        }, status_code=400)
+
+    voice = body.get("voice", "alloy")
+    lang = body.get("language", "en")
+    response_format = body.get("response_format", "wav")
+    speed = float(body.get("speed", 1.0))
+
+    # Validate & clamp speed
+    if speed < 0.25 or speed > 4.0:
+        return ORJSONResponse({
+            "error": {"message": "Speed must be between 0.25 and 4.0", "type": "BadRequestError", "param": "speed", "code": 400}
+        }, status_code=400)
+
+    # Note: "instructions" and "model" params are accepted but not used by VibeVoice
+
+    return await tts_streamer(
+        request,
+        text=text,
+        audio_base64=None,
+        speaker=voice,
+        lang=lang,
+        do_sample=False,
+        temperature=1.0,
+        top_p=1.0,
+        do_stream=False,
+    )
+
+
+@app.get("/v1/audio/voices")
+async def list_voices_v1():
+    """
+    Lists available voices for the loaded model.
+    Returns both built-in voice presets and uploaded voices.
+    """
+    builtin_voices = _get_builtin_voices()
+    uploaded = _get_uploaded_voices()
+    metadata = _load_uploaded_voices_metadata()
+
+    # All voice names (built-in + uploaded)
+    all_names = sorted(set(builtin_voices.keys()) | set(uploaded.keys()))
+
+    # Build uploaded_voices list per spec
+    uploaded_list = []
+    for name in sorted(uploaded.keys()):
+        info = metadata.get(name, {})
+        entry: dict = {
+            "name": name,
+            "consent": info.get("consent", ""),
+            "created_at": info.get("created_at", 0),
+            "file_size": info.get("file_size", 0),
+            "mime_type": info.get("mime_type", "audio/wav"),
+        }
+        if "ref_text" in info:
+            entry["ref_text"] = info["ref_text"]
+        if "speaker_description" in info:
+            entry["speaker_description"] = info["speaker_description"]
+        uploaded_list.append(entry)
+
+    return ORJSONResponse({
+        "voices": all_names,
+        "uploaded_voices": uploaded_list,
+    })
+
+
+@app.post("/v1/audio/voices")
+async def upload_voice(
+    request: Request,
+    audio_sample: UploadFile = File(...),
+    consent: str = Form(...),
+    name: str = Form(...),
+    ref_text: Optional[str] = Form(None),
+    speaker_description: Optional[str] = Form(None),
+):
+    """
+    Upload a new voice sample for voice cloning.
+
+    Form parameters:
+        - audio_sample (file, required): Audio file (max 10MB).
+        - consent (str, required): Consent recording ID.
+        - name (str, required): Name for the new voice.
+        - ref_text (str, optional): Transcript of the audio.
+        - speaker_description (str, optional): Description of the voice.
+    """
+    # Validate audio file size (max 10MB)
+    audio_bytes = await audio_sample.read()
+    max_size = 10 * 1024 * 1024  # 10 MB
+    if len(audio_bytes) > max_size:
+        return ORJSONResponse({
+            "error": {"message": "Audio file exceeds maximum size of 10MB", "type": "BadRequestError", "code": 400}
+        }, status_code=400)
+
+    # Validate name
+    if not name.strip():
+        return ORJSONResponse({
+            "error": {"message": "Voice name cannot be empty", "type": "BadRequestError", "code": 400}
+        }, status_code=400)
+
+    # Validate consent
+    if not consent.strip():
+        return ORJSONResponse({
+            "error": {"message": "Consent cannot be empty", "type": "BadRequestError", "code": 400}
+        }, status_code=400)
+
+    # Detect MIME type from uploaded filename
+    mime_type = audio_sample.content_type or "audio/wav"
+    supported_mimes = {"audio/wav", "audio/mpeg", "audio/mp3", "audio/flac",
+                       "audio/ogg", "audio/aac", "audio/webm", "video/mp4",
+                       "application/octet-stream"}
+    # We accept application/octet-stream as a fallback
+
+    try:
+        info = _upload_voice(
+            name=name.strip(),
+            audio_bytes=audio_bytes,
+            consent=consent.strip(),
+            ref_text=ref_text.strip() if ref_text else None,
+            speaker_description=speaker_description.strip() if speaker_description else None,
+        )
+        return ORJSONResponse({
+            "success": True,
+            "voice": info,
+        })
+    except ValueError as exc:
+        return ORJSONResponse({
+            "error": {"message": str(exc), "type": "BadRequestError", "code": 400}
+        }, status_code=400)
+
+
+@app.delete("/v1/audio/voices/{name}")
+async def delete_voice(name: str):
+    """
+    Delete an uploaded voice sample.
+
+    Path parameters:
+        - name (str, required): Name of the voice to delete.
+    """
+    try:
+        _delete_voice(name)
+        return ORJSONResponse({
+            "success": True,
+            "message": f"Voice '{name}' deleted successfully",
+        })
+    except FileNotFoundError:
+        return ORJSONResponse({
+            "success": False,
+            "error": f"Voice '{name}' not found",
+        }, status_code=404)
+
+
+@app.websocket("/v1/audio/speech/stream")
+async def websocket_speech_stream(ws: WebSocket):
+    """
+    WebSocket endpoint for streaming text input and streaming audio output.
+
+    Client -> Server messages:
+        {"type": "session.config", ...}  — Session configuration (sent first)
+        {"type": "input.text", "text": "..."} — Text chunk
+        {"type": "input.done"} — End of input
+
+    Server -> Client messages:
+        {"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}
+        <binary PCM16 frames>  — when stream_audio=true
+        {"type": "audio.done", "sentence_index": 0, "total_bytes": N, "error": false}
+        {"type": "session.done", "total_sentences": N}
+        {"type": "error", "message": "..."}
+    """
+    global data_queue
+
+    sample_rate = 24000
+    num_channels = 1
+    batch_size = 1
+
+    # Default session config
+    config_params = {
+        "voice": "alloy",
+        "lang": "en",
+        "stream_audio": False,
+        "do_sample": False,
+        "temperature": 1.0,
+        "top_p": 1.0,
+    }
+
+    try:
+        await ws.accept()
+
+        # 1. Expect session.config first
+        raw = await ws.receive_json()
+        if raw.get("type") != "session.config":
+            await ws.send_json({"type": "error", "message": "First message must be session.config"})
+            await ws.close()
+            return
+
+        # Parse session config
+        config_params["voice"] = raw.get("voice", config_params["voice"])
+        config_params["lang"] = raw.get("language", raw.get("lang", config_params["lang"]))
+        config_params["stream_audio"] = raw.get("stream_audio", config_params["stream_audio"])
+        config_params["do_sample"] = raw.get("do_sample", config_params["do_sample"])
+        config_params["temperature"] = float(raw.get("temperature", config_params["temperature"]))
+        config_params["top_p"] = float(raw.get("top_p", config_params["top_p"]))
+
+        # Resolve voice
+        speaker = config_params["voice"]
+        lang = config_params["lang"]
+        voice_found = (
+            speaker in voice_list or
+            f"{lang}-{speaker}" in voice_list or
+            any(speaker.lower() in key.lower() for key in voice_list)
+        )
+        if not voice_found:
+            await ws.send_json({"type": "error", "message": f"Voice '{speaker}' not found"})
+            await ws.close()
+            return
+
+        # 2. Collect text chunks until input.done
+        text_buffer = ""
+        while True:
+            msg = await ws.receive_json()
+            msg_type = msg.get("type", "")
+            if msg_type == "input.done":
+                break
+            elif msg_type == "input.text":
+                text_buffer += msg.get("text", "")
+            else:
+                await ws.send_json({"type": "error", "message": f"Unknown message type: {msg_type}"})
+
+        if not text_buffer.strip():
+            await ws.send_json({"type": "error", "message": "No text received"})
+            await ws.close()
+            return
+
+        # 3. Generate audio via tts_streamer logic (synchronous within websocket handler)
+        audio_streamer = AsyncAudioStreamer(batch_size=batch_size, timeout=1.0)
+        data_queue.put(
+            text_buffer,
+            None,  # audio_base64
+            lang,
+            speaker,
+            config_params["do_sample"],
+            config_params["temperature"],
+            config_params["top_p"],
+            audio_streamer,
+        )
+
+        # Send audio.start
+        await ws.send_json({
+            "type": "audio.start",
+            "sentence_index": 0,
+            "sentence_text": text_buffer.strip(),
+            "format": "pcm",
+            "sample_rate": sample_rate,
+        })
+
+        total_bytes = 0
+        pcm_chunks: List[bytes] = []
+
+        try:
+            async for batch_chunks in audio_streamer:
+                if 0 in batch_chunks:
+                    chunk = batch_chunks[0]
+                    pcm_bytes = chunk_to_pcm16_bytes(chunk, num_channels)
+                    if pcm_bytes:
+                        if config_params["stream_audio"]:
+                            await ws.send_bytes(pcm_bytes)
+                        else:
+                            pcm_chunks.append(pcm_bytes)
+                        total_bytes += len(pcm_bytes)
+        except Exception:
+            audio_streamer.end()
+            raise
+        finally:
+            audio_streamer.end()
+
+        # If not streaming per chunk, send as one binary frame
+        if not config_params["stream_audio"] and pcm_chunks:
+            all_pcm = b"".join(pcm_chunks)
+            await ws.send_bytes(all_pcm)
+            total_bytes = len(all_pcm)
+
+        # Send audio.done
+        await ws.send_json({
+            "type": "audio.done",
+            "sentence_index": 0,
+            "total_bytes": total_bytes,
+            "error": False,
+        })
+
+        # Send session.done
+        await ws.send_json({
+            "type": "session.done",
+            "total_sentences": 1,
+        })
+
+    except WebSocketDisconnect:
+        LOGGER.info("WebSocket client disconnected")
+    except Exception as exc:
+        LOGGER.error(f"WebSocket error: {traceback.format_exc()}")
+        try:
+            await ws.send_json({"type": "error", "message": str(exc)})
+        except Exception:
+            pass
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
 
 async def tts_streamer(
     request: Request,
@@ -463,8 +980,15 @@ async def tts_streamer(
     sample_rate = 24000
     num_channels = 1
 
-    if f"{lang}-{speaker}" not in voice_list and not Path(os.path.join(ROOT_DIR, 'temp-voices', f"{lang}-{speaker}.wav")).exists() and audio_base64 is None:
-        return ORJSONResponse({"error": f"Speaker '{speaker}' not found for language '{lang}'."}, status_code=404)
+    # Resolve voice availability
+    if audio_base64 is None:
+        voice_found = (
+            speaker in voice_list or
+            f"{lang}-{speaker}" in voice_list or
+            any(speaker.lower() in key.lower() for key in voice_list)
+        )
+        if not voice_found:
+            return ORJSONResponse({"error": f"Speaker '{speaker}' not found for language '{lang}'."}, status_code=404)
 
     # instantiate streamer (adjust signature if needed)
     audio_streamer = AsyncAudioStreamer(batch_size=batch_size, timeout=1.0)  # type: ignore

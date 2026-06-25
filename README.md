@@ -69,6 +69,51 @@ cd VibeVoice/
 uv pip install -e .
 ```
 
+## Docker Deployment
+
+A Docker setup is provided for deploying the REST API server.
+
+```bash
+cd VibeVoice/
+
+# Build and start (requires nvidia-container-toolkit)
+MODEL_PATH=vibevoice/VibeVoice-1.5B docker compose -f docker/docker-compose.yaml up -d
+
+# Or set MODEL_PATH in .env then:
+# docker compose -f docker/docker-compose.yaml up -d
+```
+
+The server starts on `http://localhost:5000` with the following:
+
+| Feature | Details |
+|---------|---------|
+| GPU | CUDA 12.4, NVIDIA container runtime |
+| Port | 5000 (configurable via `API_PORT`) |
+| Persistence | Model cache and uploaded voices survive restarts via Docker volumes |
+| Health check | `GET /v1/audio/voices` |
+
+See [`docker/docker-compose.yaml`](docker/docker-compose.yaml) for all configurable environment variables.
+
+### Starting the API server directly (without Docker)
+
+```bash
+MODEL_PATH=vibevoice/VibeVoice-1.5B python demo/uvicorn.main.py
+```
+
+Set these environment variables (or create a `.env` file in the project root):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_PATH` | *(required)* | HuggingFace model ID or local path |
+| `API_HOST` | `127.0.0.1` | Bind address |
+| `API_PORT` | `5000` | Server port |
+| `WORKER_NUM` | `1` | Uvicorn workers |
+| `CFG_SCALE` | `2.0` | Classifier-free guidance scale |
+| `SEED` | `42` | Random seed |
+| `MAX_BATCH_SIZE` | `4` | Max concurrent generation requests |
+| `SPEAKER_SAMPLES_DIR` | `demo/uploaded-voices/` | Uploaded voice storage directory |
+| `SPEAKER_MAX_UPLOADED` | `1000` | Max uploaded voices |
+
 ## Usage
 
 ### 🚨 Tips
@@ -131,6 +176,70 @@ python demo/streaming_inference_from_file.py \
 Voice presets are stored as `.pt` files in `demo/voices/streaming_model/`. These contain pre-computed KV cache embeddings for fast inference. Voice cloning is not supported for now.
 
 NOTE: If you get the warning `Some weights of VibeVoiceStreamingForConditionalGenerationInference were not initialized from the model checkpoint` when loading, this is expected. This is because voice cloning capabilities have been removed from the model.
+
+## REST API Server
+
+VibeVoice includes an OpenAI-compatible REST API for text-to-speech generation. Start the server (see [Docker Deployment](#docker-deployment) or run directly) and use the following endpoints:
+
+### Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/v1/audio/speech` | Generate speech from text |
+| `GET` | `/v1/audio/voices` | List available voices |
+| `POST` | `/v1/audio/voices` | Upload a custom voice sample |
+| `DELETE` | `/v1/audio/voices/{name}` | Delete an uploaded voice |
+| `WS` | `/v1/audio/speech/stream` | WebSocket streaming TTS |
+
+### Quick examples
+
+**Generate speech (curl):**
+```bash
+curl -X POST http://localhost:5000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"input": "Hello, how are you?", "voice": "alloy", "language": "en"}' \
+    --output output.wav
+```
+
+**List available voices:**
+```bash
+curl http://localhost:5000/v1/audio/voices
+```
+
+**Upload a custom voice:**
+```bash
+curl -X POST http://localhost:5000/v1/audio/voices \
+    -F "audio_sample=@/path/to/voice.wav" \
+    -F "consent=my_consent_id" \
+    -F "name=custom_speaker" \
+    -F "ref_text=Optional transcript of the audio"
+```
+
+**Delete a voice:**
+```bash
+curl -X DELETE http://localhost:5000/v1/audio/voices/custom_speaker
+```
+
+**WebSocket streaming:**
+```python
+import asyncio
+import websockets
+import json
+
+async def stream_tts():
+    async with websockets.connect("ws://localhost:5000/v1/audio/speech/stream") as ws:
+        await ws.send(json.dumps({"type": "session.config", "voice": "alloy", "language": "en"}))
+        await ws.send(json.dumps({"type": "input.text", "text": "Hello world!"}))
+        await ws.send(json.dumps({"type": "input.done"}))
+
+        async for msg in ws:
+            data = json.loads(msg)
+            print(data["type"])  # audio.start, audio.done, session.done
+
+asyncio.run(stream_tts())
+```
+
+The API spec is based on the [vLLM-Omni Speech API](https://docs.vllm.ai/projects/vllm-omni).
 
 ## [Finetuning](./FINETUNING.md)
 
