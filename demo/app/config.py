@@ -14,6 +14,7 @@ class ApiConfig(BaseSettings):
     cfg_scale: float = Field(2.0)
     seed: int = Field(42)
     max_batch_size: int = Field(4)
+    attn_implementation: str = Field('sdpa')
 
     class Config:
         env_file = dotenv.find_dotenv(usecwd=True)

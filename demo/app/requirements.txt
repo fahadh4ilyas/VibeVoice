@@ -6,3 +6,4 @@ orjson
 gunicorn
 uvicorn
 python-dotenv
+langdetect

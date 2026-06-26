@@ -1,23 +1,29 @@
 # VibeVoice TTS API — Docker Compose
 #
-# Start:
+# Default (SDPA):
 #   MODEL_PATH=vibevoice/VibeVoice-1.5B docker compose -f docker/docker-compose.yaml up -d
 #
-# Or set MODEL_PATH in .env:
+# With Flash Attention 2:
+#   ATTN_IMPLEMENTATION=flash_attention_2 \
+#     MODEL_PATH=vibevoice/VibeVoice-1.5B docker compose -f docker/docker-compose.yaml up -d
+#
+# Or set vars in .env:
 #   echo "MODEL_PATH=vibevoice/VibeVoice-1.5B" > .env
+#   echo "ATTN_IMPLEMENTATION=flash_attention_2" >> .env   # optional
 #   docker compose -f docker/docker-compose.yaml up -d
 #
 # Notes:
 #   - Requires nvidia-container-toolkit for GPU access
-#   - First start downloads model (~3-15 GB) to the vibevoice-models volume
-
-version: "3.8"
+#   - Models are cached in a Docker named volume (persists across restarts)
+#   - First start downloads model (~3-15 GB) into the vibevoice-models volume
 
 services:
   vibevoice-api:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      args:
+        - ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-sdpa}
     image: vibevoice-api:latest
     container_name: vibevoice-api
     restart: unless-stopped
@@ -37,9 +43,12 @@ services:
       - SEED=${SEED:-42}
       - MAX_BATCH_SIZE=${MAX_BATCH_SIZE:-4}
 
+      # --- Attention backend (flash_attention_2, sdpa, or eager) ---
+      # Also drives Docker build: flash_attention_2 uses devel image + flash-attn
+      - ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-sdpa}
+
       # --- Model cache ---
       - HF_HOME=/app/hf-cache
-      - HF_HUB_ENABLE_HF_TRANSFER=${HF_HUB_ENABLE_HF_TRANSFER:-1}
 
       # --- Voice storage ---
       - SPEAKER_SAMPLES_DIR=/app/uploaded-voices
@@ -49,10 +58,8 @@ services:
       - "${API_PORT:-5000}:5000"
 
     volumes:
-      # Persistent model cache (survives container rebuilds)
       - vibevoice-models:/app/hf-cache
-      # Persistent uploaded voices
-      - vibevoice-voices:/app/uploaded-voices
+      - ./demo/uploaded-voices:/app/uploaded-voices
 
     deploy:
       resources:
@@ -75,8 +82,13 @@ services:
         max-size: "10m"
         max-file: "3"
 
+    networks:
+      - vibevoice
+
+networks:
+  vibevoice:
+    name: vibevoice-net
+
 volumes:
   vibevoice-models:
     name: vibevoice-models
-  vibevoice-voices:
-    name: vibevoice-voices

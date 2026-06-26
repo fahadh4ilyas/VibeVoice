@@ -1,6 +1,7 @@
 # fastapi_stream_wav.py
 import os
 import io
+import re
 import time
 import wave
 import json
@@ -202,6 +203,56 @@ def _reload_voice_list() -> None:
 
 _reload_voice_list()
 
+# --- Language normalization: full name → short code ---
+_LANGUAGE_MAP: Dict[str, str] = {
+    "english": "en", "en": "en",
+    "indonesian": "id", "indonesia": "id", "id": "id",
+    "chinese": "zh", "mandarin": "zh", "zh": "zh",
+    "indian": "in", "hindi": "in", "in": "in",
+    "arabic": "ar", "ar": "ar",
+    "japanese": "ja", "ja": "ja",
+    "korean": "ko", "ko": "ko",
+    "french": "fr", "fr": "fr",
+    "german": "de", "de": "de",
+    "spanish": "es", "es": "es",
+    "portuguese": "pt", "pt": "pt",
+    "russian": "ru", "ru": "ru",
+    "italian": "it", "it": "it",
+}
+
+# Lazy-loaded language detector (requires langdetect: pip install langdetect)
+_detector_factory = None
+
+
+def _get_detector():
+    """Return the detect function from langdetect, or None if unavailable."""
+    try:
+        from langdetect import detect, DetectorFactory
+        DetectorFactory.seed = 0  # deterministic results
+        return detect
+    except ImportError:
+        return None
+
+
+def _auto_detect_language(text: str) -> str:
+    """Detect language from text using langdetect. Falls back to 'en' if unavailable."""
+    detect = _get_detector()
+    if detect is None:
+        return "en"
+    try:
+        iso = detect(text)
+        return _LANGUAGE_MAP.get(iso, iso)
+    except Exception:
+        return "en"
+
+
+def _normalize_language(lang: str, text: str = "") -> str:
+    """Convert a language name to a short code. If 'auto', detect from text."""
+    lang = lang.strip().lower()
+    if lang in ("auto", "automatic"):
+        return _auto_detect_language(text)
+    return _LANGUAGE_MAP.get(lang, lang)
+
 class DataQueue:
 
     def __init__(self, max_batch_size: int, model: VibeVoiceForConditionalGenerationInference, processor: VibeVoiceProcessor):
@@ -245,7 +296,7 @@ class DataQueue:
                         break
             if voice_path is None:
                 raise ValueError(f"Voice '{speaker}' not found for language '{lang}'")
-            voice_sample = voice_path
+            voice_sample = voice_path.as_posix()
         inputs = self.processor(
             text=[full_script], # Wrap in list for batch processing
             voice_samples=[voice_sample], # Wrap in list for batch processing
@@ -376,7 +427,8 @@ async def lifespan(app: FastAPI):
     model = VibeVoiceForConditionalGenerationInference.from_pretrained(
         config.model_path,
         torch_dtype=torch.bfloat16,
-        attn_implementation='flash_attention_2',
+        attn_implementation=config.attn_implementation,
+        device_map="cuda",
     )
     model.eval()
     model.set_ddpm_inference_steps(num_steps=10)
@@ -660,7 +712,7 @@ async def generate_speech(
         }, status_code=400)
 
     voice = body.get("voice", "alloy")
-    lang = body.get("language", "en")
+    lang = _normalize_language(body.get("language", "en"), text)
     response_format = body.get("response_format", "wav")
     speed = float(body.get("speed", 1.0))
 
@@ -810,16 +862,17 @@ async def delete_voice(name: str):
 async def websocket_speech_stream(ws: WebSocket):
     """
     WebSocket endpoint for streaming text input and streaming audio output.
+    Audio is generated per-sentence while text is still being received.
 
-    Client -> Server messages:
-        {"type": "session.config", ...}  — Session configuration (sent first)
-        {"type": "input.text", "text": "..."} — Text chunk
-        {"type": "input.done"} — End of input
+    Client -> Server:
+        {"type": "session.config", ...}   — first message
+        {"type": "input.text", "text": "..."} — text chunks
+        {"type": "input.done"}            — end of input
 
-    Server -> Client messages:
-        {"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}
-        <binary PCM16 frames>  — when stream_audio=true
-        {"type": "audio.done", "sentence_index": 0, "total_bytes": N, "error": false}
+    Server -> Client:
+        {"type": "audio.start", "sentence_index": N, "sentence_text": "...", ...}
+        <binary PCM16>  (when stream_audio=true)
+        {"type": "audio.done", "sentence_index": N, ...}
         {"type": "session.done", "total_sentences": N}
         {"type": "error", "message": "..."}
     """
@@ -829,14 +882,14 @@ async def websocket_speech_stream(ws: WebSocket):
     num_channels = 1
     batch_size = 1
 
-    # Default session config
-    config_params = {
+    config_params: Dict[str, Any] = {
         "voice": "alloy",
         "lang": "en",
         "stream_audio": False,
         "do_sample": False,
         "temperature": 1.0,
         "top_p": 1.0,
+        "silence_duration": 0.3,
     }
 
     try:
@@ -849,15 +902,16 @@ async def websocket_speech_stream(ws: WebSocket):
             await ws.close()
             return
 
-        # Parse session config
         config_params["voice"] = raw.get("voice", config_params["voice"])
         config_params["lang"] = raw.get("language", raw.get("lang", config_params["lang"]))
+        # Store raw value for per-sentence resolution (supports "auto")
+        raw_lang = config_params["lang"]
         config_params["stream_audio"] = raw.get("stream_audio", config_params["stream_audio"])
         config_params["do_sample"] = raw.get("do_sample", config_params["do_sample"])
         config_params["temperature"] = float(raw.get("temperature", config_params["temperature"]))
         config_params["top_p"] = float(raw.get("top_p", config_params["top_p"]))
+        config_params["silence_duration"] = float(raw.get("silence_duration", config_params["silence_duration"]))
 
-        # Resolve voice
         speaker = config_params["voice"]
         lang = config_params["lang"]
         voice_found = (
@@ -870,84 +924,151 @@ async def websocket_speech_stream(ws: WebSocket):
             await ws.close()
             return
 
-        # 2. Collect text chunks until input.done
-        text_buffer = ""
-        while True:
-            msg = await ws.receive_json()
-            msg_type = msg.get("type", "")
-            if msg_type == "input.done":
-                break
-            elif msg_type == "input.text":
-                text_buffer += msg.get("text", "")
-            else:
-                await ws.send_json({"type": "error", "message": f"Unknown message type: {msg_type}"})
+        # --- concurrent receiver / sender via sentence queue ---
+        sentence_queue: asyncio.Queue = asyncio.Queue()
+        disconnected = asyncio.Event()
 
-        if not text_buffer.strip():
-            await ws.send_json({"type": "error", "message": "No text received"})
-            await ws.close()
-            return
+        async def receiver():
+            """Read text chunks, split into sentences, push to queue."""
+            buffer = ""
+            sentence_endings = re.compile(r'(?<=[.!?\n])\s+')
+            try:
+                while True:
+                    msg = await ws.receive_json()
+                    msg_type = msg.get("type", "")
+                    if msg_type == "input.done":
+                        remaining = buffer.strip()
+                        if remaining:
+                            await sentence_queue.put(remaining)
+                        break
+                    elif msg_type == "input.text":
+                        buffer += msg.get("text", "")
+                        while True:
+                            match = sentence_endings.search(buffer)
+                            if not match:
+                                break
+                            end = match.start() + 1
+                            sentence = buffer[:end].strip()
+                            buffer = buffer[end:].lstrip()
+                            if sentence:
+                                await sentence_queue.put(sentence)
+                    else:
+                        if not disconnected.is_set():
+                            await ws.send_json({"type": "error", "message": f"Unknown message type: {msg_type}"})
+            except WebSocketDisconnect:
+                disconnected.set()
+            except Exception:
+                disconnected.set()
+            finally:
+                await sentence_queue.put(None)  # sentinel
 
-        # 3. Generate audio via tts_streamer logic (synchronous within websocket handler)
-        audio_streamer = AsyncAudioStreamer(batch_size=batch_size, timeout=1.0)
-        data_queue.put(
-            text_buffer,
-            None,  # audio_base64
-            lang,
-            speaker,
-            config_params["do_sample"],
-            config_params["temperature"],
-            config_params["top_p"],
-            audio_streamer,
-        )
+        async def sender():
+            """Pull sentences from queue, generate audio, send to client."""
+            sentence_index = 0
+            sentence = await sentence_queue.get()
+            while sentence is not None:
+                if disconnected.is_set():
+                    sentence = await sentence_queue.get()
+                    continue
 
-        # Send audio.start
-        await ws.send_json({
-            "type": "audio.start",
-            "sentence_index": 0,
-            "sentence_text": text_buffer.strip(),
-            "format": "pcm",
-            "sample_rate": sample_rate,
-        })
+                # Silence: full for most, half for comma-ending sentences
+                sd = float(config_params["silence_duration"])
+                if re.search(r'[,،]\s*$', sentence):
+                    sd = sd / 2.0
+                silence_samples = int(sd * sample_rate)
+                silence_bytes = np.zeros(silence_samples, dtype=np.float32).astype(np.int16).tobytes()
 
-        total_bytes = 0
-        pcm_chunks: List[bytes] = []
+                audio_streamer = AsyncAudioStreamer(batch_size=batch_size, timeout=1.0)
+                sentence_lang = _normalize_language(raw_lang, sentence)
+                data_queue.put(
+                    sentence, None, sentence_lang, speaker,
+                    config_params["do_sample"],
+                    config_params["temperature"],
+                    config_params["top_p"],
+                    audio_streamer,
+                )
 
-        try:
-            async for batch_chunks in audio_streamer:
-                if 0 in batch_chunks:
-                    chunk = batch_chunks[0]
-                    pcm_bytes = chunk_to_pcm16_bytes(chunk, num_channels)
-                    if pcm_bytes:
-                        if config_params["stream_audio"]:
-                            await ws.send_bytes(pcm_bytes)
-                        else:
-                            pcm_chunks.append(pcm_bytes)
-                        total_bytes += len(pcm_bytes)
-        except Exception:
-            audio_streamer.end()
-            raise
-        finally:
-            audio_streamer.end()
+                try:
+                    await ws.send_json({
+                        "type": "audio.start",
+                        "sentence_index": sentence_index,
+                        "sentence_text": sentence,
+                        "format": "pcm",
+                        "sample_rate": sample_rate,
+                    })
+                except WebSocketDisconnect:
+                    disconnected.set()
+                    audio_streamer.end()
+                    sentence = await sentence_queue.get()
+                    continue
 
-        # If not streaming per chunk, send as one binary frame
-        if not config_params["stream_audio"] and pcm_chunks:
-            all_pcm = b"".join(pcm_chunks)
-            await ws.send_bytes(all_pcm)
-            total_bytes = len(all_pcm)
+                total_bytes = 0
+                pcm_chunks: List[bytes] = []
+                try:
+                    async for batch_chunks in audio_streamer:
+                        if disconnected.is_set():
+                            break
+                        if 0 in batch_chunks:
+                            chunk = batch_chunks[0]
+                            pcm_bytes = chunk_to_pcm16_bytes(chunk, num_channels)
+                            if pcm_bytes:
+                                if config_params["stream_audio"]:
+                                    await ws.send_bytes(pcm_bytes)
+                                else:
+                                    pcm_chunks.append(pcm_bytes)
+                                total_bytes += len(pcm_bytes)
+                except WebSocketDisconnect:
+                    disconnected.set()
+                except Exception:
+                    pass
+                finally:
+                    audio_streamer.end()
 
-        # Send audio.done
-        await ws.send_json({
-            "type": "audio.done",
-            "sentence_index": 0,
-            "total_bytes": total_bytes,
-            "error": False,
-        })
+                if disconnected.is_set():
+                    sentence = await sentence_queue.get()
+                    continue
 
-        # Send session.done
-        await ws.send_json({
-            "type": "session.done",
-            "total_sentences": 1,
-        })
+                # Peek next sentence; if more coming, append silence
+                next_sentence = await sentence_queue.get()
+                if next_sentence is not None and silence_bytes:
+                    pcm_chunks.append(silence_bytes)
+                    total_bytes += len(silence_bytes)
+
+                all_pcm = b"".join(pcm_chunks)
+                if not config_params["stream_audio"]:
+                    try:
+                        await ws.send_bytes(all_pcm)
+                    except WebSocketDisconnect:
+                        disconnected.set()
+                        sentence = next_sentence
+                        continue
+                elif silence_bytes and next_sentence is not None:
+                    try:
+                        await ws.send_bytes(silence_bytes)
+                    except WebSocketDisconnect:
+                        disconnected.set()
+                        sentence = next_sentence
+                        continue
+
+                try:
+                    await ws.send_json({
+                        "type": "audio.done",
+                        "sentence_index": sentence_index,
+                        "total_bytes": total_bytes,
+                        "error": False,
+                    })
+                except WebSocketDisconnect:
+                    disconnected.set()
+                sentence_index += 1
+                sentence = next_sentence
+
+            if not disconnected.is_set():
+                await ws.send_json({
+                    "type": "session.done",
+                    "total_sentences": sentence_index,
+                })
+
+        await asyncio.gather(receiver(), sender())
 
     except WebSocketDisconnect:
         LOGGER.info("WebSocket client disconnected")
