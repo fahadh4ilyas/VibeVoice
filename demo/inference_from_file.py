@@ -189,11 +189,11 @@ def parse_args():
         help="CFG (Classifier-Free Guidance) scale for generation (default: 1.3)",
     )
     parser.add_argument(
-    "--seed",
-    type=int,
-    default=None,
-    help="Random seed for reproducibility (optional)",
-)
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility (optional)",
+    )
     return parser.parse_args()
 
 def main():
